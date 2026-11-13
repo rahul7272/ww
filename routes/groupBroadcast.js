@@ -8,7 +8,7 @@ import GroupBroadcast from "../models/GroupBroadcast.js";
 import WhatsAppGroup from "../models/WhatsAppGroup.js";
 import WhatsAppSession from "../models/WhatsAppSession.js";
 import WhatsAppService from "../services/WhatsAppService.js";
-import groupSyncService from "../services/groupSyncService.js";
+import groupSyncService from "../services/GroupSyncService.js";
 import {
   startBroadcastCampaign,
   pauseBroadcastCampaign,
