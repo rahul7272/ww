@@ -29,6 +29,34 @@ const paymentRecordSchema = new mongoose.Schema(
   { _id: true }
 );
 
+const invoiceNoteSchema = new mongoose.Schema(
+  {
+    note: { type: String, required: true, trim: true },
+    authorName: { type: String, default: "Admin", trim: true },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { _id: true }
+);
+
+const reminderRecordSchema = new mongoose.Schema(
+  {
+    milestone: {
+      type: String,
+      enum: ["2_days_before", "due_date", "overdue_1", "manual", "payment_receipt"],
+      default: "manual",
+    },
+    sentAt: { type: Date, default: Date.now },
+    recipientPhone: { type: String, default: "", trim: true },
+    messageId: { type: String, default: "", trim: true },
+    messageSnippet: { type: String, default: "", trim: true },
+    pdfAttached: { type: Boolean, default: false },
+    pdfUrl: { type: String, default: "", trim: true },
+    sessionId: { type: String, default: "", trim: true },
+    status: { type: String, default: "sent", trim: true },
+  },
+  { _id: true }
+);
+
 const invoiceSchema = new mongoose.Schema(
   {
     userId: {
@@ -43,6 +71,18 @@ const invoiceSchema = new mongoose.Schema(
       index: true,
       default: null,
     },
+    clientId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Client",
+      index: true,
+      default: null,
+    },
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Company",
+      index: true,
+      default: null,
+    },
     queryId: { type: String, default: "", index: true },
 
     invoiceNumber: { type: String, required: true, trim: true, index: true },
@@ -50,8 +90,8 @@ const invoiceSchema = new mongoose.Schema(
     dueDate: { type: Date, required: true },
     templateId: {
       type: String,
-      enum: ["template-1", "template-2", "template-3", "template-4"],
-      default: "template-1",
+      default: "corporate-gst",
+      trim: true,
     },
 
     // Snapshotted Client Info
@@ -116,14 +156,25 @@ const invoiceSchema = new mongoose.Schema(
 
     // Terms, Notes & Audit
     terms: { type: String, default: "" },
-    notes: { type: String, default: "" },
+    notes: { type: String, default: "" }, // Default terms/notes on printed invoice
+    activityNotes: [invoiceNoteSchema], // Internal track record / brief notes
     payments: [paymentRecordSchema],
+
+    // WhatsApp Reminder tracking
+    whatsappReminderSentAt: { type: Date, default: null },
+    whatsappReminderCount: { type: Number, default: 0 },
+    pdfUrl: { type: String, default: "" },
+    remindersSent: [reminderRecordSchema],
   },
   { timestamps: true }
 );
 
 invoiceSchema.index({ userId: 1, invoiceNumber: 1 });
 invoiceSchema.index({ userId: 1, contactId: 1 });
+invoiceSchema.index({ userId: 1, clientId: 1 });
+invoiceSchema.index({ userId: 1, companyId: 1 });
+invoiceSchema.index({ userId: 1, status: 1 });
+invoiceSchema.index({ userId: 1, dueDate: 1 });
 
 const Invoice = mongoose.model("Invoice", invoiceSchema);
 export default Invoice;

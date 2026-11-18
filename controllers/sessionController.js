@@ -397,6 +397,8 @@ export const getSessionGroups = async (req, res) => {
       success: true,
       data: result.groups,
       total: result.total,
+      totalMembers: result.totalMembers || 0,
+      adminCount: result.adminCount || 0,
       page: result.page,
       limit: result.limit,
       hasMore: result.hasMore,
@@ -431,10 +433,16 @@ export const syncSessionGroups = async (req, res) => {
       id: g.jid,
     }));
 
+    const totalMembers = groups.reduce((acc, g) => acc + (g.participantCount || 0), 0);
+    const adminCount = groups.filter((g) => g.isMeAdmin).length;
+
     res.json({
       success: true,
       message: "Groups synchronized successfully from WhatsApp",
       count: syncResult.count,
+      total: groups.length,
+      totalMembers,
+      adminCount,
       data: mapped,
       lastSyncedAt: new Date(),
     });
@@ -475,15 +483,53 @@ export const getGroupInviteLink = async (req, res) => {
 
     const session = await WhatsAppSession.findOne({
       sessionId: id,
-       userId: req.user._id,
+      userId: req.user._id,
     });
 
     if (!session) {
       return res.status(404).json({ error: "Session not found" });
     }
 
+    // 1. Check if inviteCode is already stored in MongoDB
+    const cachedGroup = await WhatsAppGroup.findOne({ sessionId: id, jid: groupId }).select("inviteCode").lean();
+    if (cachedGroup?.inviteCode) {
+      return res.json({
+        success: true,
+        inviteCode: cachedGroup.inviteCode,
+        link: `https://chat.whatsapp.com/${cachedGroup.inviteCode}`,
+      });
+    }
+
+    // 2. Fallback to Baileys socket
     const link = await WhatsAppService.getGroupInviteLink(id, groupId);
-    res.json({ success: true, link });
+    const code = WhatsAppService.extractGroupInviteCode(link);
+    if (code) {
+      await WhatsAppGroup.updateOne(
+        { sessionId: id, jid: groupId },
+        { $set: { inviteCode: code } }
+      ).catch(() => {});
+    }
+    res.json({ success: true, inviteCode: code, link });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+};
+
+export const getCommonMembers = async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const session = await WhatsAppSession.findOne({
+      sessionId: id,
+      userId: req.user._id,
+    });
+
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const result = await groupSyncService.getCommonMembers(id, req.user._id, req.query);
+    res.json(result);
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }
@@ -679,6 +725,7 @@ export default {
   syncSessionGroups,
   getGroupMetadata,
   getGroupInviteLink,
+  getCommonMembers,
   createGroups,
   createMultiAccountGroups,
   addGroupParticipants,

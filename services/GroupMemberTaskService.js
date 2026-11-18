@@ -24,12 +24,17 @@ class GroupMemberTaskService {
   }
 
   computeStats(members = []) {
+    const added = members.filter((m) => m.status === "added").length;
+    const invited = members.filter((m) => m.status === "invited").length;
+    const failed = members.filter((m) => m.status === "failed").length;
+    const pending = members.filter((m) => m.status === "pending").length;
     return {
       total: members.length,
-      added: members.filter((m) => m.status === "added").length,
-      invited: members.filter((m) => m.status === "invited").length,
-      failed: members.filter((m) => m.status === "failed").length,
-      pending: members.filter((m) => m.status === "pending").length,
+      added,
+      invited,
+      failed,
+      pending,
+      notYetAdded: pending + failed,
     };
   }
 
@@ -198,7 +203,14 @@ class GroupMemberTaskService {
     await task.save();
 
     if (status === "running") {
-      await this.startTask(userId, task._id);
+      try {
+        await this.startTask(userId, task._id);
+      } catch (startErr) {
+        console.warn(`[GroupMemberTask] Task created but could not start immediately: ${startErr.message}`);
+        task.status = "draft";
+        task.lastError = startErr.message;
+        await task.save();
+      }
     }
 
     return task;
@@ -697,15 +709,9 @@ class GroupMemberTaskService {
       }
     }
     if (liveSessions.length === 0) {
-      for (const [sId, activeSock] of WhatsAppService.sockets.entries()) {
-        if (WhatsAppService.isSessionWorking(sId)) {
-          liveSessions.push({
-            sessionId: sId,
-            name: "Connected Account",
-            phoneNumber: (activeSock.user?.id || "").split("@")[0].split(":")[0]
-          });
-        }
-      }
+      throw new Error(
+        "Cannot start task: All WhatsApp sender accounts are currently disconnected. Please connect or scan your account in WhatsApp Accounts, then click Start / Resume."
+      );
     }
 
     if (liveSessions.length > 0) {

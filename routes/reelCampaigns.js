@@ -25,7 +25,7 @@ router.post("/:id/pause", auth, pauseCampaign);
 router.post("/:id/resume", auth, resumeCampaign);
 router.post("/reel/:id/retry", auth, retryReel);
 router.delete("/reel/:id", auth, deleteReel);
-router.get("/debug/trigger-upload-check", triggerUploadCheck);
+router.get("/debug/trigger-upload-check", auth, triggerUploadCheck);
 router.get("/debug/token-status", auth, debugTokenStatus);
 
 export default router;

@@ -27,8 +27,18 @@ export function buildPhoneMatchKeys(rawValue) {
   return Array.from(keys);
 }
 
+// In-memory LRU cache for high-frequency WhatsApp message CRM resolution
+const crmMatchCache = new Map();
+const CRM_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const CRM_CACHE_MAX_ENTRIES = 1000;
+
+export function invalidateCrmMatchCache() {
+  crmMatchCache.clear();
+}
+
 /**
  * Finds matching Client, Company, and CrmContact/Query records for a raw phone number / JID owned by userId.
+ * Optimized with in-memory caching and targeted indexed queries to eliminate full-collection table scans.
  */
 export async function findMatchingCrmRecords(userId, rawPhone) {
   const targetKeys = new Set(buildPhoneMatchKeys(rawPhone));
@@ -36,10 +46,32 @@ export async function findMatchingCrmRecords(userId, rawPhone) {
     return { client: null, company: null, query: null };
   }
 
+  // 1. Check in-memory cache
+  const cacheKey = `${userId}:${Array.from(targetKeys).sort().join(',')}`;
+  const cachedEntry = crmMatchCache.get(cacheKey);
+  if (cachedEntry && Date.now() - cachedEntry.timestamp < CRM_CACHE_TTL_MS) {
+    return cachedEntry.data;
+  }
+
+  // 2. Targeted indexed query
+  const keyArr = Array.from(targetKeys);
+  const primary10 = keyArr.find((k) => k.length === 10) || keyArr[0];
+  const phoneRegex = primary10 ? new RegExp(primary10) : null;
+
+  const clientFilter = { userId };
+  const companyFilter = { userId };
+  const queryFilter = { userId };
+
+  if (phoneRegex) {
+    clientFilter.mobile = phoneRegex;
+    companyFilter.phone = phoneRegex;
+    queryFilter.phone = phoneRegex;
+  }
+
   const [clients, companies, queries] = await Promise.all([
-    Client.find({ userId }).select("_id firstName lastName mobile").lean().catch(() => []),
-    Company.find({ userId }).select("_id name phone").lean().catch(() => []),
-    CrmContact.find({ userId }).select("_id name phone leadStatus queryId queryTitle budget requirement").lean().catch(() => []),
+    Client.find(clientFilter).select("_id firstName lastName mobile").lean().catch(() => []),
+    Company.find(companyFilter).select("_id name phone").lean().catch(() => []),
+    CrmContact.find(queryFilter).select("_id name phone leadStatus queryId queryTitle budget requirement").lean().catch(() => []),
   ]);
 
   let matchedClient = null;
@@ -69,7 +101,16 @@ export async function findMatchingCrmRecords(userId, rawPhone) {
     }
   }
 
-  return { client: matchedClient, company: matchedCompany, query: matchedQuery };
+  const result = { client: matchedClient, company: matchedCompany, query: matchedQuery };
+
+  // 3. Cache result with LRU bounds
+  if (crmMatchCache.size >= CRM_CACHE_MAX_ENTRIES) {
+    const firstKey = crmMatchCache.keys().next().value;
+    if (firstKey) crmMatchCache.delete(firstKey);
+  }
+  crmMatchCache.set(cacheKey, { data: result, timestamp: Date.now() });
+
+  return result;
 }
 
 /**

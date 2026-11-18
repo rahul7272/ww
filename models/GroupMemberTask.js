@@ -119,6 +119,7 @@ const groupMemberTaskSchema = new mongoose.Schema(
       invited: { type: Number, default: 0 },
       failed: { type: Number, default: 0 },
       pending: { type: Number, default: 0 },
+      notYetAdded: { type: Number, default: 0 },
     },
     lastError: {
       type: String,

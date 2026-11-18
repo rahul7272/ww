@@ -4,6 +4,7 @@ import authMiddleware from "../middleware/auth.js";
 import Message from "../models/Message.js";
 import Campaign from "../models/Campaign.js";
 import { WhatsAppSession } from "../models/index.js";
+import WhatsAppGroup from "../models/WhatsAppGroup.js";
 import ApiKey from "../models/ApiKey.js";
 import SubscriptionService from "../services/SubscriptionService.js";
 
@@ -106,6 +107,22 @@ router.get("/dashboard", authMiddleware, async (req, res) => {
       ? Math.round((deliveredMessages / sentMessages) * 1000) / 10
       : 0;
 
+    // Total WhatsApp Groups & Members across user's connected accounts
+    const groupStats = await WhatsAppGroup.aggregate([
+      { $match: { userId } },
+      {
+        $group: {
+          _id: null,
+          totalGroups: { $sum: 1 },
+          totalGroupMembers: { $sum: "$participantCount" },
+          adminGroups: { $sum: { $cond: ["$isMeAdmin", 1, 0] } },
+        },
+      },
+    ]);
+    const totalGroups = groupStats[0]?.totalGroups || 0;
+    const totalGroupMembers = groupStats[0]?.totalGroupMembers || 0;
+    const adminGroups = groupStats[0]?.adminGroups || 0;
+
     res.json({
       success: true,
       data: {
@@ -121,6 +138,9 @@ router.get("/dashboard", authMiddleware, async (req, res) => {
           activeCampaigns,
           apiKeyCount,
           deliveryRate,
+          totalGroups,
+          totalGroupMembers,
+          adminGroups,
         },
         weekChart,
         recentMessages: recentMessages.map(m => ({

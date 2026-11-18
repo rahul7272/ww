@@ -43,7 +43,8 @@ const fileFilter = (req, file, cb) => {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   ];
 
-  if (allowedMimes.includes(file.mimetype)) {
+  const ext = path.extname(file.originalname || "").toLowerCase();
+  if (allowedMimes.includes(file.mimetype) || ext === ".pdf" || file.mimetype === "application/pdf") {
     cb(null, true);
   } else {
     cb(new Error(`File type not allowed: ${file.mimetype}`), false);

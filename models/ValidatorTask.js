@@ -1,5 +1,15 @@
 import mongoose from 'mongoose';
 
+const validatorNoteSchema = new mongoose.Schema(
+  {
+    noteId: { type: String, default: () => new mongoose.Types.ObjectId().toString() },
+    text: { type: String, required: true, trim: true },
+    author: { type: String, default: 'Admin' },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { _id: false }
+);
+
 const validatorTaskSchema = new mongoose.Schema(
   {
     userId: {
@@ -13,6 +23,29 @@ const validatorTaskSchema = new mongoose.Schema(
       required: true,
       trim: true,
       default: 'WhatsApp Verification Task',
+    },
+    notes: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    activityNotes: [validatorNoteSchema],
+    safetyProfile: {
+      type: String,
+      enum: ['ultra-safe', 'balanced', 'turbo'],
+      default: 'balanced',
+    },
+    safetyCooldownSeconds: {
+      type: Number,
+      default: 5,
+      min: 0,
+      max: 60,
+    },
+    safetyCooldownEvery: {
+      type: Number,
+      default: 50,
+      min: 10,
+      max: 500,
     },
     selectedSessions: [
       {

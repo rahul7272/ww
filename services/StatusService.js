@@ -272,7 +272,7 @@ class StatusService {
             userId: item.userId,
             sessionId: item.sessionId,
             type: item.type,
-            text: item.text,
+            text: item.caption || item.text,
             backgroundColor: item.backgroundColor,
             mediaType: item.mediaType,
             mediaUrl: item.mediaUrl,
@@ -295,6 +295,11 @@ class StatusService {
           item.errorMessage = err.message || "Failed to post status.";
           item.debugInfo = { error: err.message, failedAt: new Date() };
           await item.save();
+        }
+
+        // Anti-flood safety spacing: wait 8 seconds between consecutive dispatches to prevent rate-limits
+        if (pendingStatuses.indexOf(pending) < pendingStatuses.length - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 8000));
         }
       }
     } catch (e) {

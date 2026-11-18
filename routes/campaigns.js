@@ -15,6 +15,8 @@ router.post(
 router.post("/create", authMiddleware, campaignController.createCampaign);
 router.get("/", authMiddleware, campaignController.getCampaigns);
 router.get("/:id", authMiddleware, campaignController.getCampaignDetails);
+router.put("/:id", authMiddleware, campaignController.updateCampaign);
+router.patch("/:id", authMiddleware, campaignController.updateCampaign);
 router.delete("/:id", authMiddleware, campaignController.deleteCampaign);
 
 // Campaign Actions

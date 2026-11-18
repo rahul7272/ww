@@ -194,9 +194,18 @@ export const createAdminPlan = async (req, res) => {
         .json({ success: false, error: "name and slug are required" });
     }
 
+    const slug = String(payload.slug).toLowerCase().trim();
+    const existing = await SubscriptionPlan.findOne({ slug });
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        error: `A subscription plan with the slug '${slug}' already exists. Please choose a unique slug.`,
+      });
+    }
+
     const plan = await SubscriptionPlan.create({
       ...payload,
-      slug: String(payload.slug).toLowerCase().trim(),
+      slug,
       features: Array.isArray(payload.features) ? payload.features : [],
     });
 
@@ -205,6 +214,12 @@ export const createAdminPlan = async (req, res) => {
       data: SubscriptionService.toClientPlan(plan),
     });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        error: "A subscription plan with this slug already exists. Please choose a unique slug.",
+      });
+    }
     res.status(400).json({ success: false, error: err.message });
   }
 };
@@ -217,6 +232,16 @@ export const updateAdminPlan = async (req, res) => {
     const payload = { ...req.body };
     if (payload.slug) {
       payload.slug = String(payload.slug).toLowerCase().trim();
+      const existing = await SubscriptionPlan.findOne({
+        slug: payload.slug,
+        _id: { $ne: id },
+      });
+      if (existing) {
+        return res.status(400).json({
+          success: false,
+          error: `Another subscription plan with slug '${payload.slug}' already exists.`,
+        });
+      }
     }
 
     const plan = await SubscriptionPlan.findByIdAndUpdate(id, payload, {
@@ -230,6 +255,12 @@ export const updateAdminPlan = async (req, res) => {
 
     res.json({ success: true, data: SubscriptionService.toClientPlan(plan) });
   } catch (err) {
+    if (err.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        error: "A subscription plan with this slug already exists.",
+      });
+    }
     res.status(400).json({ success: false, error: err.message });
   }
 };
@@ -449,11 +480,15 @@ export const getAdminUsersUsage = async (req, res) => {
                 status: sub.status,
                 startedAt: sub.startedAt,
                 expiresAt: sub.expiresAt,
+                customStorageLimitMb: sub.customStorageLimitMb ?? null,
+                trialUsed: Boolean(sub.trialUsed),
                 plan: sub.planId
                   ? {
                       _id: sub.planId._id,
                       name: sub.planId.name,
                       slug: sub.planId.slug,
+                      priceMonthly: sub.planId.priceMonthly,
+                      isDemo: sub.planId.isDemo,
                     }
                   : null,
               }
@@ -467,6 +502,54 @@ export const getAdminUsersUsage = async (req, res) => {
     res.json({ success: true, data: rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+export const setUserStorageOverride = async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+
+    const { userId, customStorageLimitMb } = req.body;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "userId is required" });
+    }
+
+    const usageSummary = await SubscriptionService.setUserStorageOverride(
+      userId,
+      customStorageLimitMb === "" || customStorageLimitMb === null || customStorageLimitMb === undefined
+        ? null
+        : Number(customStorageLimitMb)
+    );
+
+    res.json({
+      success: true,
+      message: customStorageLimitMb !== null && customStorageLimitMb !== undefined && customStorageLimitMb !== ""
+        ? `Custom storage limit of ${customStorageLimitMb} MB configured successfully`
+        : "Custom storage override removed, user restored to plan default",
+      data: usageSummary,
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+};
+
+export const recalculateUserStorage = async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+
+    const { userId } = req.params;
+    if (!userId) {
+      return res.status(400).json({ success: false, error: "userId is required" });
+    }
+
+    const usageSummary = await SubscriptionService.getUsageSummary(userId);
+    res.json({
+      success: true,
+      message: "User storage recalculated successfully",
+      data: usageSummary,
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
   }
 };
 
@@ -484,4 +567,6 @@ export default {
   assignPlanToUser,
   adjustUserSubscription,
   getAdminUsersUsage,
+  setUserStorageOverride,
+  recalculateUserStorage,
 };

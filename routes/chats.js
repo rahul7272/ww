@@ -38,6 +38,17 @@ import {
   createOrUpdateChat,
   streamChatMessageMedia,
 } from "../controllers/chatController.js";
+import {
+  getStatusHistory,
+  getMonthlyCalendarStatuses,
+  deleteStatus,
+  postStatus,
+  postStatusFromMedia,
+  postBulkSchedule,
+  updateScheduledStatus,
+  retryStatus,
+  bulkDeleteStatuses,
+} from "../controllers/statusController.js";
 
 const router = express.Router();
 
@@ -125,5 +136,17 @@ router.get( "/:sessionId/reminders/:chatJid(.+)",        getChatReminders);
 router.post("/:sessionId/reminders/:chatJid(.+)",        upload.single("file"), createChatReminder);
 router.delete("/:sessionId/reminders/:reminderId",       deleteChatReminder);
 router.post("/:sessionId/reminders/:reminderId/dismiss", dismissChatReminder);
+
+// WhatsApp Status / Story routes
+router.get(   "/:sessionId/status/history",          getStatusHistory);
+router.get(   "/:sessionId/status/calendar",         getMonthlyCalendarStatuses);
+router.delete("/:sessionId/status/bulk-delete",      bulkDeleteStatuses);
+router.post(  "/:sessionId/status/bulk-delete",      bulkDeleteStatuses);
+router.delete("/:sessionId/status/:statusId",         deleteStatus);
+router.put(   "/:sessionId/status/:statusId",         updateScheduledStatus);
+router.post(  "/:sessionId/status/:statusId/retry",   retryStatus);
+router.post(  "/:sessionId/status/from-media",        postStatusFromMedia);
+router.post(  "/:sessionId/status/bulk-schedule",     upload.array("files", 50), postBulkSchedule);
+router.post(  "/:sessionId/status",                   upload.single("file"), postStatus);
 
 export default router;

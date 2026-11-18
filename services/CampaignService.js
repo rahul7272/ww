@@ -1,5 +1,7 @@
 import WhatsAppService from "./WhatsAppService.js";
-import { WhatsAppSession, Message, Campaign, WaChat, WaChatMessage } from "../models/index.js";
+import { WhatsAppSession, Message, Campaign, WaChat, WaChatMessage, TemplateLog } from "../models/index.js";
+import WhatsAppTemplate from "../models/WhatsAppTemplate.js";
+import TemplateMessageService from "./TemplateMessageService.js";
 import mongoose from "mongoose";
 import SubscriptionService from "./SubscriptionService.js";
 
@@ -8,6 +10,7 @@ class CampaignService {
   constructor() {
     this.activeCampaigns = new Map();
     this.io = null;
+    this.MAX_CONCURRENT_CAMPAIGNS = parseInt(process.env.MAX_CONCURRENT_CAMPAIGNS, 10) || 5;
   }
 
   async findUserSession(userId, sessionRef) {
@@ -57,14 +60,23 @@ class CampaignService {
       throw new Error("Session is not connected");
     }
 
+    const maxCampaignSize = parseInt(process.env.MAX_CAMPAIGN_SIZE, 10) || 1000;
+    const normalizedNumbers = this.normalizeNumbers(numbers);
+    if (normalizedNumbers.length > maxCampaignSize) {
+      throw new Error(`Campaign exceeds maximum allowed recipients (${normalizedNumbers.length}/${maxCampaignSize})`);
+    }
+
+    const minAllowedSec = Math.max(1, Math.floor(parseInt(process.env.MIN_MESSAGE_DELAY || "1000", 10) / 1000));
+    const safeDelaySeconds = Math.max(Number(delaySeconds) || 10, minAllowedSec);
+
     const campaign = new Campaign({
       userId: new mongoose.Types.ObjectId(userId),
       sessionId: session._id,
       name,
       message,
-      numbers: this.normalizeNumbers(numbers),
+      numbers: normalizedNumbers,
       status: "draft",
-      delaySeconds,
+      delaySeconds: safeDelaySeconds,
       sentCount: 0,
       failedCount: 0,
       currentIndex: 0,
@@ -102,8 +114,21 @@ class CampaignService {
       throw new Error("Campaign not found");
     }
 
-    if (campaign.status !== "draft" && campaign.status !== "cancelled") {
+    if (campaign.status !== "draft" && campaign.status !== "cancelled" && campaign.status !== "scheduled") {
       throw new Error("Campaign cannot be started");
+    }
+
+    // Bulkhead pattern: limit simultaneous active campaigns to prevent MongoDB pool starvation
+    if (this.activeCampaigns.size >= this.MAX_CONCURRENT_CAMPAIGNS) {
+      campaign.status = "scheduled";
+      campaign.scheduledFor = new Date(Date.now() + 60 * 1000);
+      await campaign.save();
+      return {
+        campaignId: campaign._id,
+        status: "scheduled",
+        queued: true,
+        message: `System active campaign capacity reached (${this.activeCampaigns.size}/${this.MAX_CONCURRENT_CAMPAIGNS} active). Campaign queued to run automatically when a slot opens.`,
+      };
     }
 
     campaign.status = "running";
@@ -150,6 +175,15 @@ class CampaignService {
     let sentCount = campaign.sentCount || 0;
     let failedCount = campaign.failedCount || 0;
 
+    let templateDoc = null;
+    if (campaign.templateId) {
+      try {
+        templateDoc = await WhatsAppTemplate.findById(campaign.templateId);
+      } catch (err) {
+        console.warn(`[CampaignService] Could not preload template ${campaign.templateId}:`, err.message);
+      }
+    }
+
     for (let i = campaign.currentIndex; i < numbers.length; i++) {
       const control = this.activeCampaigns.get(campaignId);
 
@@ -193,20 +227,49 @@ class CampaignService {
           1,
         );
 
-        const sendResult = await WhatsAppService.sendMessage(
-          sessionId,
-          phoneNumber,
-          message,
-        );
+        let sendResult = null;
+        if (templateDoc) {
+          sendResult = await TemplateMessageService.dispatch(
+            sessionId,
+            phoneNumber,
+            templateDoc,
+            campaign.templateVariables || {}
+          );
+
+          // Log template campaign dispatch
+          try {
+            await TemplateLog.create({
+              userId: campaign.userId,
+              templateId: templateDoc._id,
+              templateName: templateDoc.name,
+              displayName: templateDoc.displayName,
+              category: templateDoc.category,
+              action: "DISPATCH",
+              sessionId,
+              phoneNumber,
+              status: sendResult?.success ? "DISPATCHED" : "FAILED",
+              messageId: sendResult?.messageId || sendResult?.key?.id || "",
+              variables: campaign.templateVariables || {},
+            });
+          } catch (_) {}
+        } else {
+          sendResult = await WhatsAppService.sendMessage(
+            sessionId,
+            phoneNumber,
+            message,
+          );
+        }
 
         await SubscriptionService.consumeMessageQuota(campaign.userId, 1);
+
+        const resolvedMsgId = sendResult?.messageId || sendResult?.key?.id;
 
         await Message.updateOne(
           { _id: msgDoc._id },
           {
             status: "sent",
             sentAt: new Date(),
-            ...(sendResult?.key?.id ? { messageId: sendResult.key.id } : {}),
+            ...(resolvedMsgId ? { messageId: resolvedMsgId } : {}),
           },
         );
 
@@ -256,6 +319,7 @@ class CampaignService {
 
     await Campaign.updateOne({ _id: campaign._id }, { status: "completed" });
     this.activeCampaigns.delete(campaignId);
+    this.triggerNextQueuedCampaign();
 
     this.emit(
       "campaign:completed",
@@ -291,6 +355,9 @@ class CampaignService {
     campaign.status = "cancelled";
     await campaign.save();
 
+    this.activeCampaigns.delete(campaignId.toString());
+    this.triggerNextQueuedCampaign();
+
     this.emit("campaign:cancelled", { campaignId: campaign._id }, userId);
 
     return {
@@ -305,6 +372,9 @@ class CampaignService {
     campaign.status = "failed";
     await campaign.save();
 
+    this.activeCampaigns.delete(campaign._id.toString());
+    this.triggerNextQueuedCampaign();
+
     this.emit(
       "campaign:failed",
       {
@@ -313,6 +383,38 @@ class CampaignService {
       },
       campaign.userId,
     );
+  }
+
+  /**
+   * Bulkhead consumer: automatically launches next queued campaign when capacity frees up
+   */
+  async triggerNextQueuedCampaign() {
+    try {
+      if (this.activeCampaigns.size >= this.MAX_CONCURRENT_CAMPAIGNS) return;
+
+      const nextCampaign = await Campaign.findOne({
+        status: "scheduled",
+        scheduledFor: { $lte: new Date() },
+      }).sort({ scheduledFor: 1, createdAt: 1 });
+
+      if (nextCampaign) {
+        console.log(
+          `[CAMPAIGN BULKHEAD] Capacity available (${this.activeCampaigns.size}/${this.MAX_CONCURRENT_CAMPAIGNS}). Launching queued campaign ${nextCampaign._id}`
+        );
+        await this.startCampaign(nextCampaign._id, nextCampaign.userId);
+      }
+    } catch (err) {
+      console.warn("[CAMPAIGN BULKHEAD] triggerNextQueuedCampaign notice:", err.message);
+    }
+  }
+
+  /**
+   * Post-boot recovery hook (Phase 2 - Task 2.1).
+   * Delegates to recoverOrphanedCampaigns to restore running state or safely pause.
+   */
+  async resumeOrphanedCampaigns(io = null) {
+    const { recoverOrphanedCampaigns } = await import("../controllers/campaignController.js");
+    return recoverOrphanedCampaigns(io || this.io);
   }
 
   async getCampaign(campaignId, userId) {

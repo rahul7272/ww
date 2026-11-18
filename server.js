@@ -13,6 +13,19 @@ const __dirname = dirname(__filename);
 
 dotenv.config();
 
+// Filter out noisy libsignal cryptographic ratchet rotation dumps ("Closing session: SessionEntry")
+const _origConsoleInfo = console.info;
+console.info = (...args) => {
+  if (typeof args[0] === "string" && args[0].startsWith("Closing session:")) {
+    return;
+  }
+  _origConsoleInfo.apply(console, args);
+};
+
+import { createRequire } from "module";
+const cjsRequire = createRequire(import.meta.url);
+const { sendCopyAndUrlButtons } = cjsRequire("./utils/whatsappButtons.cjs");
+
 import { validateEnvironment } from "./config/validateEnv.js";
 const config = validateEnvironment();
 
@@ -43,15 +56,24 @@ import groupBroadcastRoutes from "./routes/groupBroadcast.js";
 import groupMemberTaskRoutes from "./routes/groupMemberTasks.js";
 import validatorRoutes from "./routes/validator.js";
 import dripRoutes from "./routes/dripCampaigns.js";
+import automationRoutes from "./routes/automation.js";
 import crmRoutes from "./routes/crm.js";
 import companyRoutes from "./routes/companies.js";
 import clientRoutes from "./routes/clients.js";
 import warmerRoutes from "./routes/warmer.js";
 import quickReplyRoutes from "./routes/quickReplies.js";
+import invoiceRoutes from "./routes/invoices.js";
+import templateRoutes from "./routes/templates.js";
+import otpRoutes from "./routes/otp.js";
+import { initOtpWorker } from "./workers/otpWorker.js";
+import { initMetaWebhookWorker } from "./workers/metaWebhookWorker.js";
 import { setSocketIO as setReelSocketIO } from "./controllers/reelCampaignController.js";
 import { startUploadScheduler } from "./services/reels/uploadScheduler.js";
 import WhatsAppService from "./services/WhatsAppService.js";
 import CampaignService from "./services/CampaignService.js";
+import { recoverOrphanedCampaigns } from "./controllers/campaignController.js";
+import storageHelper from "./utils/storageHelper.js";
+import MediaSettings from "./models/MediaSettings.js";
 import SubscriptionService from "./services/SubscriptionService.js";
 import Campaign from "./models/Campaign.js";
 import OpenRouterSettings from "./models/OpenRouterSettings.js";
@@ -60,6 +82,8 @@ import dripService from "./services/DripService.js";
 import statusService from "./services/StatusService.js";
 import WarmerService from "./services/WarmerService.js";
 import GroupMemberTaskService from "./services/GroupMemberTaskService.js";
+import invoiceReminderService from "./services/InvoiceReminderService.js";
+import prebuiltTemplateService from "./services/prebuiltTemplateService.js";
 
 
 const app = express();
@@ -106,8 +130,24 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+// ── Tiered Request Body Limits (Phase 2 - Task 2.2) ─────────────────────────
+// Higher 15MB limit strictly scoped to bulk data operations (contact lists, campaigns, CRM, flow graphs)
+const bulkPayloadRoutes = [
+  "/api/number-lists",
+  "/api/campaigns",
+  "/api/clients",
+  "/api/crm",
+  "/api/validator",
+  "/api/flows",
+  "/api/group-broadcast",
+  "/api/group-member-tasks",
+];
+app.use(bulkPayloadRoutes, express.json({ limit: "15mb" }));
+app.use(bulkPayloadRoutes, express.urlencoded({ limit: "15mb", extended: true }));
+
+// Strict 2MB global body parser to shield V8 heap from memory allocation exhaustion
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ limit: "2mb", extended: true }));
 
 app.get("/", (req, res) => {
   res.send("WhatsApp API is running v2.0.1 by ME");
@@ -151,14 +191,93 @@ app.use("/api/group-broadcast", groupBroadcastRoutes);
 app.use("/api/group-member-tasks", groupMemberTaskRoutes);
 app.use("/api/validator", validatorRoutes);
 app.use("/api/drip-campaigns", dripRoutes);
+app.use("/api/automation", automationRoutes);
 app.use("/api/crm", crmRoutes);
 app.use("/api/companies", companyRoutes);
 app.use("/api/clients", clientRoutes);
 app.use("/api/warmer", warmerRoutes);
 app.use("/api/quick-replies", quickReplyRoutes);
+app.use("/api/invoices", invoiceRoutes);
+app.use("/api/templates", templateRoutes);
+app.use("/api/v1/templates", templateRoutes);
+app.use("/api/otp", otpRoutes);
+app.use("/api/v1/otp", otpRoutes);
 
+// Endpoint requested by user to send interactive buttons via baileys_helper
+app.post("/api/whatsapp/send-buttons", async (req, res) => {
+  try {
+    const { phoneNumber, sessionId, text, footer, buttons, couponCode, url } = req.body;
+
+    if (!phoneNumber) {
+      return res.status(400).json({
+        success: false,
+        message: "phoneNumber is required",
+      });
+    }
+
+    const sock =
+      (sessionId && WhatsAppService.getSocket(sessionId)) ||
+      WhatsAppService.sockets.values().next().value;
+
+    if (!sock) {
+      return res.status(503).json({
+        success: false,
+        message: "No connected WhatsApp session available. Please connect a session first.",
+      });
+    }
+
+    const result = await sendCopyAndUrlButtons(sock, phoneNumber, {
+      text,
+      footer,
+      buttons,
+      couponCode,
+      url,
+    });
+
+    return res.json({
+      success: true,
+      messageId: result?.key?.id ?? null,
+    });
+  } catch (error) {
+    console.error("Button message error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to send interactive message",
+      error: error.message,
+    });
+  }
+});
+
+// Deep Health Check Probe for Orchestrators, Uptime Monitors, and Load Balancers
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  const dbState = mongoose.connection.readyState;
+  const isDbHealthy = dbState === 1;
+  const dbStatusMap = { 0: "disconnected", 1: "connected", 2: "connecting", 3: "disconnecting" };
+
+  const mem = process.memoryUsage();
+  const formatMB = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  const queueStats = WhatsAppService.getQueueStats ? WhatsAppService.getQueueStats() : null;
+
+  const statusCode = isDbHealthy ? 200 : 503;
+  res.status(statusCode).json({
+    status: isDbHealthy ? "ok" : "degraded",
+    database: {
+      status: dbStatusMap[dbState] || "unknown",
+      readyState: dbState,
+    },
+    uptimeSeconds: Math.floor(process.uptime()),
+    memory: {
+      heapUsed: formatMB(mem.heapUsed),
+      heapTotal: formatMB(mem.heapTotal),
+      rss: formatMB(mem.rss),
+    },
+    queues: {
+      totalQueuedTasks: queueStats?.totalQueuedTasks || 0,
+      rejectedTasksCount: queueStats?.rejectedTasksCount || 0,
+    },
+    activeWhatsAppSockets: WhatsAppService.sockets?.size || 0,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // SEO Crawlers Support: robots.txt and sitemap.xml
@@ -267,6 +386,10 @@ const start = async () => {
         console.error("Bootstrap error:", err.message)
       );
 
+      await prebuiltTemplateService.seedPrebuiltTemplates().catch((err) =>
+        console.error("Prebuilt templates bootstrap error:", err.message)
+      );
+
       await WhatsAppService.restoreSessions().catch((err) =>
         console.error("WA restore error:", err.message)
       );
@@ -284,6 +407,40 @@ const start = async () => {
     reminderService.start();
     dripService.start();
     statusService.start();
+    invoiceReminderService.start();
+    initOtpWorker();
+    initMetaWebhookWorker();
+
+    // ✅ 5. DAILY MULTI-CATEGORY MEDIA RETENTION CLEANUP RUNNER
+    const runDailyStorageCleanup = async () => {
+      try {
+        const settings = await MediaSettings.findOne({ key: "global" }).lean();
+        if (settings?.autoCleanupEnabled !== false) {
+          console.log("[STORAGE CRON] Running scheduled multi-category media retention cleanup...");
+          const result = await storageHelper.executePerCategoryAutoCleanup();
+          if (result.success && result.totalDeletedFiles > 0) {
+            console.log(
+              `[STORAGE CRON] Multi-category cleanup complete. Freed ${result.totalFreedFormatted} across ${result.totalDeletedFiles} files.`
+            );
+          } else {
+            console.log("[STORAGE CRON] Multi-category cleanup complete. No expired files needed removal.");
+          }
+        }
+      } catch (cleanupErr) {
+        console.warn("[STORAGE CRON] Scheduled media cleanup notice:", cleanupErr.message);
+      }
+    };
+    // Run initial check 60 seconds after boot, then every 24 hours
+    setTimeout(runDailyStorageCleanup, 60_000);
+    setInterval(runDailyStorageCleanup, 24 * 60 * 60 * 1000);
+
+    // ✅ 6. POST-BOOT ORPHANED CAMPAIGN RECOVERY WATCHDOG (Phase 2 - Task 2.1)
+    // Scans MongoDB 15 seconds after startup to resume running campaigns if sessions reconnected, or pause cleanly
+    setTimeout(() => {
+      recoverOrphanedCampaigns(io).catch((err) =>
+        console.error("[CAMPAIGN WATCHDOG] Post-boot recovery error:", err.message)
+      );
+    }, 15_000);
 
     // ✅ 5. SCHEDULER (SAFE)
     // const runScheduler = async () => {

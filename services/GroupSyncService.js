@@ -55,6 +55,96 @@ function emitGroupSyncProgress(io, session, payload) {
   }
 }
 
+/**
+ * Build candidate identifiers for the session owner
+ * (covers phone number, phone JID, LID, and socket user IDs)
+ */
+function buildSessionCandidateSet(sock, session, groupsArray = []) {
+  const candidates = new Set();
+
+  const addVal = (val) => {
+    if (!val || typeof val !== "string") return;
+    const cleanDigits = val.replace(/\D/g, "");
+    if (cleanDigits.length >= 7) candidates.add(cleanDigits);
+    const cleanUser = val.split("@")[0].split(":")[0];
+    if (cleanUser && cleanUser.length >= 4) candidates.add(cleanUser);
+    const base = val.split(":")[0];
+    if (base) candidates.add(base);
+    candidates.add(val.trim());
+  };
+
+  if (sock?.user?.id) addVal(sock.user.id);
+  if (sock?.user?.lid) addVal(sock.user.lid);
+  if (session?.phoneNumber) addVal(session.phoneNumber);
+
+  const phoneDigits = session?.phoneNumber ? String(session.phoneNumber).replace(/\D/g, "") : null;
+
+  // Cross-reference resolved participants in groupsArray:
+  // In modern WhatsApp, participants in groups are keyed by LID, e.g. 73560223645713@lid.
+  // Their phoneNumber is resolved to e.g. 918708604830@s.whatsapp.net.
+  // When a participant's phone matches the session phone, their p.id and p.lid ARE the user's LID!
+  if (phoneDigits && Array.isArray(groupsArray)) {
+    for (const g of groupsArray) {
+      for (const p of (g.participants || [])) {
+        const pPhoneClean = (p.phoneNumber || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+        if (pPhoneClean && (pPhoneClean === phoneDigits || (pPhoneClean.endsWith(phoneDigits) && pPhoneClean.length <= phoneDigits.length + 3))) {
+          if (p.id) addVal(p.id);
+          if (p.lid) addVal(p.lid);
+        }
+      }
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Check if the session user is an admin or creator in a group
+ */
+function evaluateGroupAdminStatus(g, candidateIds) {
+  if (!g || !candidateIds || candidateIds.size === 0) {
+    return { isMeAdmin: false, role: "member" };
+  }
+
+  // 1. Group Creator / Owner check
+  const ownerClean = (g.owner || "").split("@")[0].split(":")[0];
+  const subjectOwnerClean = (g.subjectOwner || "").split("@")[0].split(":")[0];
+  if (
+    (ownerClean && candidateIds.has(ownerClean)) ||
+    (g.owner && candidateIds.has(g.owner)) ||
+    (subjectOwnerClean && candidateIds.has(subjectOwnerClean)) ||
+    (g.subjectOwner && candidateIds.has(g.subjectOwner))
+  ) {
+    return { isMeAdmin: true, role: "superadmin" };
+  }
+
+  // 2. Participants list check
+  if (Array.isArray(g.participants)) {
+    for (const p of g.participants) {
+      const pIdClean = (p.id || "").split("@")[0].split(":")[0];
+      const pPhoneClean = (p.phoneNumber || "").split("@")[0].split(":")[0];
+      const pLidClean = (p.lid || "").split("@")[0].split(":")[0];
+
+      const isMe =
+        (p.id && candidateIds.has(p.id)) ||
+        (pIdClean && candidateIds.has(pIdClean)) ||
+        (p.phoneNumber && candidateIds.has(p.phoneNumber)) ||
+        (pPhoneClean && candidateIds.has(pPhoneClean)) ||
+        (p.lid && candidateIds.has(p.lid)) ||
+        (pLidClean && candidateIds.has(pLidClean));
+
+      if (isMe) {
+        if (p.admin === "admin" || p.admin === "superadmin") {
+          return { isMeAdmin: true, role: p.admin };
+        }
+        return { isMeAdmin: false, role: "member" };
+      }
+    }
+  }
+
+  return { isMeAdmin: false, role: "member" };
+}
+
 async function syncGroupsIntoWaChat(session, groupsArray, now = new Date()) {
   if (!session?.userId || !session?.sessionId || !Array.isArray(groupsArray) || groupsArray.length === 0) {
     return 0;
@@ -184,7 +274,7 @@ class GroupSyncService {
       const allParticipants = groupsArray.flatMap((g) => g.participants || []);
       await resolveParticipantsLids(sock, allParticipants);
 
-      const myJidClean = sock.user?.id?.split(":")[0]?.split("@")[0];
+      const candidateIds = buildSessionCandidateSet(sock, session, groupsArray);
 
       // 4. Prepare bulk operations for MongoDB
       const activeJids = [];
@@ -192,18 +282,7 @@ class GroupSyncService {
       const bulkOps = groupsArray.map((g) => {
         activeJids.push(g.id);
         const isAdminOnly = g.announce === true || g.announce === "true";
-        let isMeAdmin = false;
-
-        if (g.participants && Array.isArray(g.participants) && myJidClean) {
-          const me = g.participants.find((p) => {
-            const pIdClean = p.id?.split(":")[0]?.split("@")[0];
-            return pIdClean === myJidClean;
-          });
-          if (me && (me.admin === "admin" || me.admin === "superadmin")) {
-            isMeAdmin = true;
-          }
-        }
-
+        const { isMeAdmin } = evaluateGroupAdminStatus(g, candidateIds);
         const canSend = !isAdminOnly || isMeAdmin;
 
         const formattedParticipants = (g.participants || []).map((p) => {
@@ -281,10 +360,13 @@ class GroupSyncService {
       console.log(`[GROUP SYNC] Successfully synchronized ${groupsArray.length} groups to MongoDB for session ${sessionId}`);
 
       // 8. Emit WebSocket events to client
+      const totalMembers = groupsArray.reduce((acc, g) => acc + (g.participants?.length || 0), 0);
       if (io) {
         const payload = {
           sessionId,
           count: groupsArray.length,
+          total: groupsArray.length,
+          totalMembers,
           lastSyncedAt: now,
         };
         io.to(sessionId).emit("groups:synced", payload);
@@ -298,13 +380,13 @@ class GroupSyncService {
             status: "completed",
             stage: "completed",
             progress: 100,
-            message: `Synchronized ${groupsArray.length} WhatsApp groups`,
-            stats: { groupsCount: groupsArray.length },
+            message: `Synchronized ${groupsArray.length} WhatsApp groups (${totalMembers.toLocaleString()} total members)`,
+            stats: { groupsCount: groupsArray.length, totalMembers },
           });
         }
       }
 
-      return { success: true, count: groupsArray.length, groups: groupsArray };
+      return { success: true, count: groupsArray.length, totalMembers, groups: groupsArray };
     } catch (err) {
       console.error(`[GROUP SYNC] Error syncing groups for session ${sessionId}:`, err.message);
       await WhatsAppSession.updateOne(
@@ -334,26 +416,15 @@ class GroupSyncService {
       const session = await WhatsAppSession.findOne({ sessionId });
       if (!session || !isSessionWriteAllowed(sessionId, sock)) return;
 
-      const myJidClean = sock?.user?.id?.split(":")[0]?.split("@")[0];
       const allParticipants = groups.flatMap((g) => g.participants || []);
       if (sock) {
         await resolveParticipantsLids(sock, allParticipants);
       }
+      const candidateIds = buildSessionCandidateSet(sock, session, groups);
 
       const bulkOps = groups.map((g) => {
         const isAdminOnly = g.announce === true || g.announce === "true";
-        let isMeAdmin = false;
-
-        if (g.participants && Array.isArray(g.participants) && myJidClean) {
-          const me = g.participants.find((p) => {
-            const pIdClean = p.id?.split(":")[0]?.split("@")[0];
-            return pIdClean === myJidClean;
-          });
-          if (me && (me.admin === "admin" || me.admin === "superadmin")) {
-            isMeAdmin = true;
-          }
-        }
-
+        const { isMeAdmin } = evaluateGroupAdminStatus(g, candidateIds);
         const canSend = !isAdminOnly || isMeAdmin;
 
         const formattedParticipants = (g.participants || []).map((p) => {
@@ -560,17 +631,9 @@ class GroupSyncService {
       }
 
       // Re-evaluate admin & canSend status
-      let isMeAdmin = false;
-      if (myJidClean) {
-        const me = currentParticipants.find((p) => {
-          const pIdClean = p.id?.split(":")[0]?.split("@")[0];
-          return pIdClean === myJidClean;
-        });
-        if (me && (me.admin === "admin" || me.admin === "superadmin")) {
-          isMeAdmin = true;
-        }
-      }
-
+      const session = await WhatsAppSession.findOne({ sessionId });
+      const candidateIds = buildSessionCandidateSet(sock, session, [{ ...group.toObject(), participants: currentParticipants }]);
+      const { isMeAdmin } = evaluateGroupAdminStatus({ ...group.toObject(), participants: currentParticipants }, candidateIds);
       const canSend = !group.announce || isMeAdmin;
 
       group.participants = currentParticipants;
@@ -605,12 +668,16 @@ class GroupSyncService {
    * Fast MongoDB read with search, pagination, and sorting.
    */
   async getGroups(sessionId, userId, queryParams = {}) {
-    const { search = "", page, limit, sort = "participants", light = false } = queryParams;
+    const { search = "", page, limit, sort = "participants", light = false, adminOnly, filter: filterType } = queryParams;
 
     const filter = { sessionId, userId };
 
     if (search && search.trim()) {
       filter.subject = { $regex: search.trim(), $options: "i" };
+    }
+
+    if (adminOnly === "true" || adminOnly === true || filterType === "admin") {
+      filter.isMeAdmin = true;
     }
 
     let sortOptions = { participantCount: -1, subject: 1 };
@@ -644,15 +711,27 @@ class GroupSyncService {
       const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
       const skip = (pageNum - 1) * limitNum;
 
-      const [groups, total] = await Promise.all([
+      const [groups, total, statsAgg] = await Promise.all([
         query.skip(skip).limit(limitNum).lean(),
         WhatsAppGroup.countDocuments(filter),
+        WhatsAppGroup.aggregate([
+          { $match: filter },
+          {
+            $group: {
+              _id: null,
+              totalMembers: { $sum: "$participantCount" },
+              adminCount: { $sum: { $cond: ["$isMeAdmin", 1, 0] } },
+            },
+          },
+        ]),
       ]);
 
       const mappedGroups = groups.map((g) => ({ ...g, id: g.jid }));
       return {
         groups: mappedGroups,
         total,
+        totalMembers: statsAgg[0]?.totalMembers || 0,
+        adminCount: statsAgg[0]?.adminCount || 0,
         page: pageNum,
         limit: limitNum,
         hasMore: skip + groups.length < total,
@@ -660,11 +739,25 @@ class GroupSyncService {
     }
 
     // If no pagination requested, return all records (backward-compatible)
-    const groups = await query.lean();
+    const [groups, statsAgg] = await Promise.all([
+      query.lean(),
+      WhatsAppGroup.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: null,
+            totalMembers: { $sum: "$participantCount" },
+            adminCount: { $sum: { $cond: ["$isMeAdmin", 1, 0] } },
+          },
+        },
+      ]),
+    ]);
     const mappedGroups = groups.map((g) => ({ ...g, id: g.jid }));
     return {
       groups: mappedGroups,
       total: groups.length,
+      totalMembers: statsAgg[0]?.totalMembers || 0,
+      adminCount: statsAgg[0]?.adminCount || 0,
       page: 1,
       limit: groups.length,
       hasMore: false,
@@ -697,6 +790,133 @@ class GroupSyncService {
       return { ...group, id: group.jid };
     }
     return null;
+  }
+
+  /**
+   * Get common group members across all groups for a session, ranked from highest to lowest.
+   */
+  async getCommonMembers(sessionId, userId, queryParams = {}) {
+    const filter = { sessionId };
+    if (userId) {
+      filter.userId = userId;
+    }
+
+    const groups = await WhatsAppGroup.find(filter)
+      .select("jid subject description participantCount participants isMeAdmin inviteCode profilePic")
+      .lean();
+
+    if (!groups || groups.length === 0) {
+      return {
+        success: true,
+        summary: {
+          totalUniqueMembers: 0,
+          commonMembersCount: 0,
+          highestGroupCount: 0,
+          totalGroupsCount: 0,
+          totalMemberships: 0,
+          overlapRate: "0.0%",
+        },
+        members: [],
+        total: 0,
+        page: 1,
+        limit: 50,
+      };
+    }
+
+    const memberMap = new Map();
+    let totalMemberships = 0;
+
+    for (const g of groups) {
+      const gInviteLink = g.inviteCode ? `https://chat.whatsapp.com/${g.inviteCode}` : null;
+      for (const p of g.participants || []) {
+        totalMemberships++;
+        const rawId = p.id || p.jid || p.phoneNumber;
+        if (!rawId) continue;
+        const cleanPhone = (p.phoneNumber || rawId).split(":")[0].split("@")[0].replace(/[^\d]/g, "");
+        if (!cleanPhone) continue;
+
+        if (!memberMap.has(cleanPhone)) {
+          memberMap.set(cleanPhone, {
+            phoneNumber: cleanPhone,
+            formattedPhone: `+${cleanPhone}`,
+            jid: p.id || `${cleanPhone}@s.whatsapp.net`,
+            lid: p.lid || null,
+            groups: [],
+            adminCount: 0,
+          });
+        }
+
+        const entry = memberMap.get(cleanPhone);
+        const isAdmin = p.admin === "admin" || p.admin === "superadmin";
+        entry.groups.push({
+          jid: g.jid,
+          subject: g.subject || "WhatsApp Group",
+          participantCount: g.participantCount || 0,
+          inviteCode: g.inviteCode || null,
+          inviteLink: gInviteLink,
+          isMemberAdmin: isAdmin,
+          isMeAdmin: !!g.isMeAdmin,
+          profilePic: g.profilePic || null,
+        });
+
+        if (isAdmin) {
+          entry.adminCount++;
+        }
+      }
+    }
+
+    const allMembers = Array.from(memberMap.values()).map((m) => ({
+      ...m,
+      commonCount: m.groups.length,
+    }));
+
+    // Sort strictly from HIGHEST common count to LOWEST
+    allMembers.sort((a, b) => b.commonCount - a.commonCount);
+
+    const totalUniqueMembers = allMembers.length;
+    const commonMembersCount = allMembers.filter((m) => m.commonCount > 1).length;
+    const highestGroupCount = allMembers[0]?.commonCount || 0;
+    const overlapRate = totalUniqueMembers > 0
+      ? ((commonMembersCount / totalUniqueMembers) * 100).toFixed(1) + "%"
+      : "0.0%";
+
+    let filtered = allMembers;
+    const { search = "", minGroups = 1, page = 1, limit = 50 } = queryParams;
+
+    if (parseInt(minGroups) > 1) {
+      filtered = filtered.filter((m) => m.commonCount >= parseInt(minGroups));
+    }
+
+    if (search && search.trim()) {
+      const q = search.trim().toLowerCase();
+      filtered = filtered.filter(
+        (m) =>
+          m.phoneNumber.includes(q) ||
+          m.groups.some((g) => g.subject.toLowerCase().includes(q))
+      );
+    }
+
+    const p = Math.max(1, parseInt(page) || 1);
+    const l = Math.min(200, Math.max(1, parseInt(limit) || 50));
+    const startIndex = (p - 1) * l;
+    const paginated = filtered.slice(startIndex, startIndex + l);
+
+    return {
+      success: true,
+      summary: {
+        totalUniqueMembers,
+        commonMembersCount,
+        highestGroupCount,
+        totalGroupsCount: groups.length,
+        totalMemberships,
+        overlapRate,
+      },
+      total: filtered.length,
+      page: p,
+      limit: l,
+      hasMore: startIndex + l < filtered.length,
+      members: paginated,
+    };
   }
 }
 

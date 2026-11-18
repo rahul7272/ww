@@ -58,5 +58,15 @@ router.get(
   authMiddleware,
   subscriptionController.getAdminUsersUsage,
 );
+router.post(
+  "/admin/set-storage-override",
+  authMiddleware,
+  subscriptionController.setUserStorageOverride,
+);
+router.post(
+  "/admin/recalculate-storage/:userId",
+  authMiddleware,
+  subscriptionController.recalculateUserStorage,
+);
 
 export default router;

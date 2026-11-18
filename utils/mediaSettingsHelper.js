@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync, mkdirSync } from "fs";
+import { writeFile } from "fs/promises";
 import { join } from "path";
 import { downloadMediaMessage } from "@whiskeysockets/baileys";
 import MediaSettings from "../models/MediaSettings.js";
@@ -175,7 +176,7 @@ export async function processIncomingMediaMessage({ msg, msgContent, mediaType, 
 
       const filename = `media_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
       const filePath = join(uploadsDir, filename);
-      writeFileSync(filePath, buffer);
+      await writeFile(filePath, buffer);
 
       if (!originalDocName) {
         mediaName = filename;

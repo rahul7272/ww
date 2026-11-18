@@ -48,9 +48,11 @@ import {
 } from "../models/index.js";
 import groupSyncService from "./GroupSyncService.js";
 import chatSyncService from "./ChatSyncService.js";
+import WhatsAppTemplate from "../models/WhatsAppTemplate.js";
 import { handleIncomingMessage } from "./AiAgentService.js";
 import { executeFlowOnMessage } from "../controllers/flowExecutionController.js";
 import dripService from "./DripService.js";
+import { evaluateInboundMessage } from "./whatsappAutomationService.js";
 import { isMetaAiJid, META_AI_NORMALIZED_JID, resolveMetaAiBot } from "./MetaAiService.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -64,7 +66,7 @@ const SESSIONS_DIR =
 if (!existsSync(SESSIONS_DIR)) {
   try {
     mkdirSync(SESSIONS_DIR, { recursive: true });
-  } catch (_) {}
+  } catch (_) { }
 }
 
 /**
@@ -168,12 +170,19 @@ class WhatsAppService {
     this.reconnectCooldown = new Map(); // Tracks last reconnect time per session
     this.activeSockets = new Set(); // Tracks currently active socket connections
     this.taskQueues = new Map(); // Per-session serialized execution queue
+    this.queueDepths = new Map(); // Per-session active pending queue depth counter
+    this.MAX_SESSION_QUEUE_DEPTH = parseInt(process.env.MAX_SESSION_QUEUE_DEPTH, 10) || 200;
     this.messageCache = new Map(); // Recent message proto cache for getMessage (bounded size 1000)
+
+    // Telemetry & Backpressure Counters (Phase 3 - Task 3.1)
+    this.rejectedTasksCount = 0; // Tracks task rejections due to bounded queue saturation (HTTP 429)
+    this.expiredTasksCount = 0; // Tracks tasks discarded due to queue TTL expiration
+    this.totalEnqueuedTasks = 0; // Total lifetime enqueued socket tasks
 
     this.MAX_AUTO_RECONNECT_ATTEMPTS = 2;
     this.cachedWaVersion = null;
     this.cachedWaVersionAt = 0;
-    
+
     // High-performance group metadata cache (5 minutes TTL, useClones: false to eliminate memory/CPU overhead)
     this.groupCache = new NodeCache({
       stdTTL: 5 * 60, // 300 seconds (5 minutes)
@@ -187,16 +196,73 @@ class WhatsAppService {
   }
 
   /**
+   * Returns current pending task count queued for a session
+   */
+  getQueueDepth(sessionId) {
+    return this.queueDepths.get(sessionId) || 0;
+  }
+
+  /**
+   * Returns aggregated queue telemetry and backpressure capacity metrics across all sessions (Phase 3 - Task 3.1)
+   */
+  getQueueStats() {
+    const queueDepthsBySession = {};
+    let totalQueuedTasks = 0;
+    for (const [sessionId, depth] of this.queueDepths.entries()) {
+      if (depth > 0) {
+        queueDepthsBySession[sessionId] = depth;
+        totalQueuedTasks += depth;
+      }
+    }
+
+    return {
+      totalQueuedTasks,
+      maxPerSessionCapacity: this.MAX_SESSION_QUEUE_DEPTH,
+      activeQueuesCount: Object.keys(queueDepthsBySession).length,
+      sessionDepths: queueDepthsBySession,
+      rejectedTasksCount: this.rejectedTasksCount || 0,
+      expiredTasksCount: this.expiredTasksCount || 0,
+      totalEnqueuedTasks: this.totalEnqueuedTasks || 0,
+    };
+  }
+
+  /**
    * Enqueues an async task (e.g. sending message) on a specific session's socket.
    * Ensures tasks execute sequentially with adaptive micro-delay to prevent socket 515/428 stream errors.
+   * Enforces bounded queue capacity and task expiration deadlines (TTL).
    */
-  async enqueueSessionTask(sessionId, taskFn, minDelayMs = 150) {
+  async enqueueSessionTask(sessionId, taskFn, minDelayMs = 150, options = {}) {
+    const currentDepth = this.queueDepths.get(sessionId) || 0;
+    if (currentDepth >= this.MAX_SESSION_QUEUE_DEPTH) {
+      this.rejectedTasksCount = (this.rejectedTasksCount || 0) + 1;
+      const err = new Error(
+        `Session queue saturated (${currentDepth}/${this.MAX_SESSION_QUEUE_DEPTH} pending). Please retry shortly.`
+      );
+      err.status = 429;
+      err.code = "QUEUE_FULL";
+      err.retryAfter = 5;
+      throw err;
+    }
+
+    this.totalEnqueuedTasks = (this.totalEnqueuedTasks || 0) + 1;
+
+    // Increment pending queue depth
+    this.queueDepths.set(sessionId, currentDepth + 1);
+
+    const expiresAt = options?.ttlMs ? Date.now() + options.ttlMs : (options?.expiresAt || null);
+
     const prevPromise = this.taskQueues.get(sessionId) || Promise.resolve();
 
     let taskResultPromise;
     const nextPromise = prevPromise
-      .catch(() => {}) // Don't let previous failures break subsequent tasks
+      .catch(() => { }) // Don't let previous failures break subsequent tasks
       .then(async () => {
+        if (expiresAt && Date.now() > expiresAt) {
+          this.expiredTasksCount = (this.expiredTasksCount || 0) + 1;
+          const timeoutErr = new Error("Task expired in queue before delivery");
+          timeoutErr.code = "QUEUE_TIMEOUT";
+          throw timeoutErr;
+        }
         const result = await taskFn();
         if (minDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, minDelayMs));
@@ -206,8 +272,15 @@ class WhatsAppService {
 
     this.taskQueues.set(sessionId, nextPromise);
 
-    // Clean up queue entry when done
+    // Clean up queue entry and decrement depth when done
     nextPromise.finally(() => {
+      const depth = this.queueDepths.get(sessionId) || 1;
+      if (depth <= 1) {
+        this.queueDepths.delete(sessionId);
+      } else {
+        this.queueDepths.set(sessionId, depth - 1);
+      }
+
       if (this.taskQueues.get(sessionId) === nextPromise) {
         this.taskQueues.delete(sessionId);
       }
@@ -321,7 +394,7 @@ class WhatsAppService {
             lastGroupSyncAt: null,
           },
         }
-      ).catch(() => {});
+      ).catch(() => { });
     }
 
     console.log(`[WA CLEANUP] Cleared loaded session data (${reason}) for ${sessionId}:`, deletedCounts);
@@ -392,8 +465,8 @@ class WhatsAppService {
       for (const sid of allDataSids) {
         if (!sid || keepSet.has(sid) || this.sockets.has(sid)) continue;
         markSessionDeactivated(sid);
-        await this.removeSessionFiles(sid).catch(() => {});
-        await this.clearSessionLoadedData(sid, { resetSyncMeta: false, reason: "orphan_cleanup" }).catch(() => {});
+        await this.removeSessionFiles(sid).catch(() => { });
+        await this.clearSessionLoadedData(sid, { resetSyncMeta: false, reason: "orphan_cleanup" }).catch(() => { });
         cleaned++;
       }
       if (cleaned > 0) {
@@ -445,12 +518,12 @@ class WhatsAppService {
     await this.handleSessionStateChange(sessionId, "pending", {
       ...(clearCreds
         ? {
-            isLinked: false,
-            phoneNumber: "",
-            groupsCount: 0,
-            groupSyncStatus: "pending",
-            lastGroupSyncAt: null,
-          }
+          isLinked: false,
+          phoneNumber: "",
+          groupsCount: 0,
+          groupSyncStatus: "pending",
+          lastGroupSyncAt: null,
+        }
         : {}),
       lastError: errorMsg,
     });
@@ -485,8 +558,8 @@ class WhatsAppService {
       typeof maxAttempts === "number"
         ? maxAttempts
         : isRestart
-        ? 4
-        : this.MAX_AUTO_RECONNECT_ATTEMPTS;
+          ? 4
+          : this.MAX_AUTO_RECONNECT_ATTEMPTS;
 
     const currentAttempts = this.reconnectAttempts.get(sessionId) || 0;
     if (currentAttempts >= maxAllowed) {
@@ -713,9 +786,12 @@ class WhatsAppService {
    */
   getReconnectDelay(sessionId, baseDelay = 2000, maxDelay = 30000) {
     const attempts = this.reconnectAttempts.get(sessionId) || 0;
-    const delay = Math.min(maxDelay, baseDelay * Math.pow(1.5, attempts));
+    const ceiling = Math.min(maxDelay, baseDelay * Math.pow(1.5, attempts));
+    // Full jitter: randomize between minDelay and ceiling to prevent synchronized reconnect floods
+    const minDelay = Math.max(500, Math.floor(baseDelay * 0.5));
+    const delay = Math.floor(minDelay + Math.random() * (ceiling - minDelay));
     console.log(
-      `[WA BACKOFF] session ${sessionId}, attempts ${attempts}, delay ${delay}ms`,
+      `[WA BACKOFF] session ${sessionId}, attempts ${attempts}, jittered delay ${delay}ms (ceiling: ${ceiling}ms)`,
     );
     return delay;
   }
@@ -767,7 +843,7 @@ class WhatsAppService {
       ...patch,
     };
 
-    await SessionModel.updateOne({ sessionId }, updateData).catch(() => {});
+    await SessionModel.updateOne({ sessionId }, updateData).catch(() => { });
     const emitted = await this.emitSessionUpdate(sessionId, updateData);
     if (!emitted) {
       await this.emitSessionUpdate(sessionId, updateData);
@@ -1010,7 +1086,7 @@ class WhatsAppService {
             personaId: botInfo.personaId || "867051314767696$760019659443059",
           },
         };
-      } catch (_) {}
+      } catch (_) { }
     }
 
     // Automatically generate full high-quality link preview for text messages containing URLs
@@ -1036,7 +1112,7 @@ class WhatsAppService {
     // Interactive buttons message handling (Native Flow Buttons or formatted fallback)
     if (options.buttons && Array.isArray(options.buttons) && options.buttons.length > 0) {
       return this.enqueueSessionTask(sessionId, async () => {
-        await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+        await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
         if (!sock?.user?.id || !this.isSocketOpen(sock)) {
           throw new Error("Session is not connected or reconnecting");
         }
@@ -1075,18 +1151,11 @@ class WhatsAppService {
         }
 
         try {
+          // Direct native interactive message WITHOUT viewOnceMessage wrapper
           const waMessage = generateWAMessageFromContent(
             jid,
             {
-              viewOnceMessage: {
-                message: {
-                  messageContextInfo: {
-                    deviceListMetadata: {},
-                    deviceListMetadataVersion: 2,
-                  },
-                  interactiveMessage,
-                },
-              },
+              interactiveMessage,
             },
             {
               userJid: sock.user.id,
@@ -1094,7 +1163,40 @@ class WhatsAppService {
             }
           );
 
-          await sock.relayMessage(jid, waMessage.message, { messageId: waMessage.key.id });
+          const isPrivate = !jid.endsWith("@g.us");
+          const additionalNodes = [
+            {
+              tag: "biz",
+              attrs: {},
+              content: [
+                {
+                  tag: "interactive",
+                  attrs: {
+                    type: "native_flow",
+                    v: "1",
+                  },
+                  content: [
+                    {
+                      tag: "native_flow",
+                      attrs: {
+                        name: "mixed",
+                        v: "9",
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ];
+
+          if (isPrivate) {
+            additionalNodes.push({ tag: "bot", attrs: { biz_bot: "1" } });
+          }
+
+          await sock.relayMessage(jid, waMessage.message, {
+            messageId: waMessage.key.id,
+            additionalNodes,
+          });
           if (waMessage?.key?.id && waMessage?.message) {
             this.setCachedMessage(waMessage.key.id, waMessage.message);
           }
@@ -1118,7 +1220,7 @@ class WhatsAppService {
           }
           return fallbackResult;
         }
-      });
+      }, 150, options);
     }
 
     const payload = this.buildMessagePayload(message, mediaPath, mediaType, options);
@@ -1141,7 +1243,7 @@ class WhatsAppService {
     if (options.statusJidList) sendOptions.statusJidList = options.statusJidList;
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       if (!sock?.user?.id || !this.isSocketOpen(sock)) {
         throw new Error("Session is not connected or reconnecting");
       }
@@ -1150,7 +1252,7 @@ class WhatsAppService {
         this.setCachedMessage(result.key.id, result.message);
       }
       return result;
-    });
+    }, 150, options);
   }
 
   /**
@@ -1162,7 +1264,7 @@ class WhatsAppService {
     const jid = this.normalizeJid(chatJid);
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       return await sock.sendMessage(jid, {
         react: {
           text: emoji || "",
@@ -1256,7 +1358,7 @@ class WhatsAppService {
     const jid = this.normalizeJid(chatJid);
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       return await sock.sendMessage(jid, {
         pin: {
           type: pinType,
@@ -1276,7 +1378,7 @@ class WhatsAppService {
     const jid = this.normalizeJid(chatJid);
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       return await sock.sendMessage(jid, {
         delete: messageKey,
       });
@@ -1322,7 +1424,7 @@ class WhatsAppService {
     const jid = this.normalizeJid(chatJid);
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       return await sock.chatModify(modification, jid);
     });
   }
@@ -1371,7 +1473,7 @@ class WhatsAppService {
     const jid = this.normalizeJid(chatJid);
 
     return this.enqueueSessionTask(sessionId, async () => {
-      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+      await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
       return await sock.sendMessage(jid, {
         disappearingMessagesInChat: durationSeconds > 0 ? durationSeconds : false,
       });
@@ -1480,7 +1582,7 @@ class WhatsAppService {
       if (existsSync(sessionPath)) {
         rmSync(sessionPath, { recursive: true, force: true });
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   isValidAuthState(authState) {
@@ -1654,7 +1756,7 @@ class WhatsAppService {
               }
             }
           });
-        } catch (e) {}
+        } catch (e) { }
       }
 
       if (connection === "open") {
@@ -1703,12 +1805,15 @@ class WhatsAppService {
             progress: 10,
             message: "WhatsApp connected! Preparing to load groups and conversations...",
           });
-        } catch (_) {}
+        } catch (_) { }
 
         // Initial background staged sync for groups & chats into MongoDB (non-blocking)
         setTimeout(() => {
           this.syncSessionChats(sessionId).catch((err) => {
-            console.warn(`[WA INITIAL SYNC] Initial sync background error for ${sessionId}:`, err.message);
+            console.warn(`[WA INITIAL SYNC] Initial chat sync background error for ${sessionId}:`, err.message);
+          });
+          this.syncSessionGroups(sessionId, { prune: true }).catch((err) => {
+            console.warn(`[WA INITIAL SYNC] Initial group sync background error for ${sessionId}:`, err.message);
           });
         }, 1200);
       }
@@ -1903,7 +2008,7 @@ class WhatsAppService {
                   if (pnParticipant) {
                     participantJid = jidNormalizedUser(pnParticipant);
                   }
-                } catch (_) {}
+                } catch (_) { }
               }
             }
             // Handle incoming / phone-synced Disappearing Messages setting change (protocolMessage type 3)
@@ -1914,7 +2019,7 @@ class WhatsAppService {
                 await WaChat.updateMany(
                   { sessionId, chatJid: { $in: jidList } },
                   { $set: { ephemeralExpiration: newExpiration } }
-                ).catch(() => {});
+                ).catch(() => { });
                 if (this.io) {
                   this.io.to(sessionId).emit("chat:disappearing_changed", {
                     sessionId,
@@ -1948,9 +2053,21 @@ class WhatsAppService {
               msg.message;
             const msgContent = rawMsg?.viewOnceMessage?.message || rawMsg;
 
+            let nativeFlowSelectedText = "";
+            const nativeFlowJson = msgContent?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+            if (nativeFlowJson) {
+              try {
+                const parsed = JSON.parse(nativeFlowJson);
+                nativeFlowSelectedText = parsed.id || parsed.selected_id || parsed.display_text || "";
+              } catch (_) { }
+            }
+
             const text =
               msgContent?.conversation ||
               msgContent?.extendedTextMessage?.text ||
+              msgContent?.interactiveResponseMessage?.body?.text ||
+              nativeFlowSelectedText ||
+              msgContent?.interactiveMessage?.body?.text ||
               msgContent?.imageMessage?.caption ||
               msgContent?.videoMessage?.caption ||
               msgContent?.documentMessage?.caption ||
@@ -2061,7 +2178,7 @@ class WhatsAppService {
                   if (pnJid) {
                     resolvedSenderJid = jidNormalizedUser(pnJid);
                   }
-                } catch (lidErr) {}
+                } catch (lidErr) { }
               }
             } else if (resolvedSenderJid) {
               resolvedSenderJid = jidNormalizedUser(resolvedSenderJid);
@@ -2071,8 +2188,8 @@ class WhatsAppService {
             let resolvedPhoneNumber = isMetaAi
               ? "13135550002"
               : (isGroup || resolvedSenderJid.endsWith("@lid"))
-              ? ""
-              : (resolvedSenderJid ? resolvedSenderJid.replace(/@.*/, "").replace(/:\d+$/, "").replace(/\D/g, "") : "");
+                ? ""
+                : (resolvedSenderJid ? resolvedSenderJid.replace(/@.*/, "").replace(/:\d+$/, "").replace(/\D/g, "") : "");
 
             // Process WhatsApp media according to Admin Storage settings (VPS vs direct WhatsApp URL)
             let mediaUrl = null;
@@ -2252,8 +2369,8 @@ class WhatsAppService {
                       name: isMetaAi
                         ? "Meta AI"
                         : isGroup
-                        ? (groupSubject || "WhatsApp Group")
-                        : (contactName || fallbackPhoneLabel),
+                          ? (groupSubject || "WhatsApp Group")
+                          : (contactName || fallbackPhoneLabel),
                       contactName: isMetaAi ? "Meta AI" : (isGroup ? (groupSubject || "WhatsApp Group") : contactName),
                     },
                     ...(!isFromMe && !isExistingMsg && m.type === "notify" ? { $inc: { unreadCount: 1 } } : {}),
@@ -2266,8 +2383,8 @@ class WhatsAppService {
                   const resolvedDisplayName = isMetaAi
                     ? "Meta AI"
                     : isGroup
-                    ? (updatedChatDoc?.groupSubject || updatedChatDoc?.name || groupSubject || "WhatsApp Group")
-                    : (
+                      ? (updatedChatDoc?.groupSubject || updatedChatDoc?.name || groupSubject || "WhatsApp Group")
+                      : (
                         (updatedChatDoc?.name && !/^\+\d+$/.test(updatedChatDoc.name.trim()) ? updatedChatDoc.name.trim() : "") ||
                         updatedChatDoc?.contactName ||
                         contactName ||
@@ -2365,9 +2482,9 @@ class WhatsAppService {
                           },
                           $inc: { totalConversations: 1 },
                         }
-                      ).exec().catch(() => {});
+                      ).exec().catch(() => { });
                     }
-                  } catch (_) {}
+                  } catch (_) { }
                 }
               }
             } catch (saveErr) {
@@ -2381,6 +2498,51 @@ class WhatsAppService {
               console.log(
                 `[WA INCOMING] Msg from ${resolvedSenderJid || senderJid} (${resolvedPhoneNumber}): "${cleanText}" (sessionId: ${sessionId})`
               );
+
+              // Check if incoming text or button click matches an interactive Template Quick Reply with an Auto-Reply configured
+              if (effectiveUserId && cleanText && !isGroup && !isMetaAi) {
+                try {
+                  const queryText = cleanText.trim();
+
+                  // Direct test button reply handling
+                  if (queryText === 'btn_yes' || queryText.toLowerCase() === 'yes ✅' || queryText.toLowerCase() === 'yes') {
+                    this.sendMessage(sessionId, resolvedSenderJid || senderJid, 'Great, you chose YES! 🎉').catch(() => {});
+                  } else if (queryText === 'btn_no' || queryText.toLowerCase() === 'no ❌' || queryText.toLowerCase() === 'no') {
+                    this.sendMessage(sessionId, resolvedSenderJid || senderJid, 'Okay, you chose NO.').catch(() => {});
+                  }
+
+                  const matchedTemplate = await WhatsAppTemplate.findOne({
+                    userId: effectiveUserId,
+                    "buttons.type": "QUICK_REPLY",
+                    $or: [
+                      { "buttons.text": { $regex: `^${queryText}$`, $options: "i" } },
+                      { "buttons.value": { $regex: `^${queryText}$`, $options: "i" } },
+                    ],
+                  }).lean();
+
+                  if (matchedTemplate) {
+                    const matchedBtn = matchedTemplate.buttons?.find(
+                      (b) =>
+                        b.type === "QUICK_REPLY" &&
+                        ((b.text && b.text.trim().toLowerCase() === queryText.toLowerCase()) ||
+                          (b.value && b.value.trim().toLowerCase() === queryText.toLowerCase()))
+                    );
+
+                    if (matchedBtn?.autoReplyText) {
+                      console.log(`[QUICK REPLY AUTO] Matched button "${matchedBtn.text}", auto-replying to ${resolvedSenderJid || senderJid}`);
+                      setTimeout(async () => {
+                        try {
+                          await this.sendMessage(sessionId, resolvedSenderJid || senderJid, matchedBtn.autoReplyText);
+                        } catch (sendAutoErr) {
+                          console.warn("[QUICK REPLY AUTO] Failed to send auto-reply:", sendAutoErr.message);
+                        }
+                      }, 1200);
+                    }
+                  }
+                } catch (qrAutoErr) {
+                  console.warn("[QUICK REPLY AUTO] Notice:", qrAutoErr.message);
+                }
+              }
 
               // Check active drip sequences and stop sequence on customer reply
               dripService
@@ -2396,16 +2558,69 @@ class WhatsAppService {
                 ).catch((err) => console.error("[WA MESSAGE] Flow trigger error:", err.message));
               }
 
-              handleIncomingMessage(sessionId, senderJid, text, async (jid, content) => {
-                const liveSock = this.sockets.get(sessionId);
-                if (!liveSock || !this.isSocketOpen(liveSock)) {
-                  throw new Error("Session is not connected");
+              // Check AI Agent first (Precedence check: "Skipped when a chatbot already answered the message")
+              (async () => {
+                let chatbotAnswered = false;
+                try {
+                  chatbotAnswered = await handleIncomingMessage(sessionId, senderJid, text, async (jid, content) => {
+                    const liveSock = this.sockets.get(sessionId);
+                    if (!liveSock || !this.isSocketOpen(liveSock)) {
+                      throw new Error("Session is not connected");
+                    }
+                    await liveSock.sendPresenceUpdate("composing", jid).catch(() => { });
+                    await new Promise((resolve) => setTimeout(resolve, 2000));
+                    await this.sendMessage(sessionId, jid, content);
+                    await this.sockets.get(sessionId)?.sendPresenceUpdate("paused", jid).catch(() => { });
+                  });
+                } catch (err) {
+                  console.error("[WA MESSAGE] AI Agent error:", err);
                 }
-                await liveSock.sendPresenceUpdate("composing", jid).catch(() => {});
-                await new Promise((resolve) => setTimeout(resolve, 2000));
-                await this.sendMessage(sessionId, jid, content);
-                await this.sockets.get(sessionId)?.sendPresenceUpdate("paused", jid).catch(() => {});
-              }).catch(err => console.error("[WA MESSAGE] AI Agent error:", err));
+
+                // Automation Rules (Welcome message, Away message, Business hours)
+                // WhatsApp Only, strictly skipped when group or when chatbot already answered
+                if (effectiveUserId && !isGroup) {
+                  try {
+                    const targetJid = resolvedSenderJid || senderJid;
+                    console.log(`[AUTOMATION] ⚡ Checking inbound automation for ${targetJid} on ${sessionId} (pushName: ${safePushName || msg.pushName || contactName})`);
+                    const result = await evaluateInboundMessage({
+                      userId: effectiveUserId,
+                      sessionId,
+                      senderJid: targetJid,
+                      pushName: safePushName || msg.pushName || contactName || "",
+                      phoneNumber: resolvedPhoneNumber,
+                      chatbotAnswered: Boolean(chatbotAnswered),
+                    });
+                    console.log(`[AUTOMATION] ⚡ Decision for ${targetJid}:`, result);
+
+                    if (result && (result.action === "send_welcome" || result.action === "send_away")) {
+                      if (result.text && targetJid) {
+                        const liveSock = this.sockets.get(sessionId);
+                        if (liveSock && this.isSocketOpen(liveSock)) {
+                          await liveSock.sendPresenceUpdate("composing", targetJid).catch(() => {});
+                          await new Promise((r) => setTimeout(r, 1200));
+                          await this.sendMessage(sessionId, targetJid, result.text);
+                          await this.sockets.get(sessionId)?.sendPresenceUpdate("paused", targetJid).catch(() => {});
+                          console.log(`[AUTOMATION] ✅ ${result.action} successfully sent to ${targetJid}`);
+                        } else {
+                          console.warn(`[AUTOMATION] ⚠️ Socket not open for session ${sessionId}, cannot send reply`);
+                        }
+                      }
+
+                      // If welcome message configured "Then continue in flow"
+                      if (result.action === "send_welcome" && result.thenContinueType === "flow") {
+                        executeFlowOnMessage(
+                          sessionId,
+                          resolvedPhoneNumber || targetJid,
+                          cleanText || "Welcome",
+                          effectiveUserId
+                        ).catch((err) => console.error("[AUTOMATION] Flow trigger error:", err.message));
+                      }
+                    }
+                  } catch (autoErr) {
+                    console.error("[AUTOMATION] Inbound message evaluation error:", autoErr.message);
+                  }
+                }
+              })().catch((err) => console.error("[WA MESSAGE] Pipeline error:", err.message));
             }
           }
         }
@@ -2457,7 +2672,7 @@ class WhatsAppService {
             await Message.updateOne(
               { messageId: msgId },
               { $set: { status: newStatus, ...(newStatus === "read" ? { readAt: new Date() } : {}) } }
-            ).catch(() => {});
+            ).catch(() => { });
 
             if (this.io) {
               const statusPayload = {
@@ -2471,7 +2686,7 @@ class WhatsAppService {
                 : this.io.to(sessionId);
               targetRoom.emit("chat:message_status", statusPayload);
             }
-          } catch (e) {}
+          } catch (e) { }
         }
       }
     });
@@ -2497,7 +2712,7 @@ class WhatsAppService {
             await Message.updateOne(
               { messageId: msgId },
               { $set: { status: newStatus, ...(isRead ? { readAt: new Date() } : {}) } }
-            ).catch(() => {});
+            ).catch(() => { });
 
             if (this.io) {
               const statusPayload = {
@@ -2512,7 +2727,7 @@ class WhatsAppService {
                 : this.io.to(sessionId);
               targetRoom.emit("chat:message_status", statusPayload);
             }
-          } catch (e) {}
+          } catch (e) { }
         }
       }
     });
@@ -2544,7 +2759,7 @@ class WhatsAppService {
           await WaChat.updateOne(
             { sessionId, chatJid: id },
             { $set: { isTyping: isComposing, isOnline: isOnline } }
-          ).catch(() => {});
+          ).catch(() => { });
         }
       } catch (err) {
         console.warn("[WA PRESENCE] presence.update error:", err.message);
@@ -2725,7 +2940,7 @@ class WhatsAppService {
         continue;
       }
       results.push({ sessionId: sId, status: "connecting" });
-      this.reconnectSession(sId, { manual: true, ...options }).catch(() => {});
+      this.reconnectSession(sId, { manual: true, ...options }).catch(() => { });
       if (i < sessionIds.length - 1) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
       }
@@ -2832,7 +3047,7 @@ class WhatsAppService {
       if (this.sockets.has(sessionId)) {
         try {
           this.removeSocket(sessionId);
-        } catch (e) {}
+        } catch (e) { }
       }
 
       console.log("[WA RECONNECT] checking creds", { sessionId, allowQR, attempt: this.reconnectAttempts.get(sessionId) || 0 });
@@ -2974,7 +3189,7 @@ class WhatsAppService {
           const draftSock = this.sockets.get(draft.sessionId);
           const hasQr = this.pendingQRCodes.has(draft.sessionId);
           if (!draftSock && !hasQr) {
-            await this.deleteSession(draft.sessionId).catch(() => {});
+            await this.deleteSession(draft.sessionId).catch(() => { });
           }
         }
 
@@ -2991,7 +3206,7 @@ class WhatsAppService {
               await SessionModel.updateOne(
                 { sessionId: s.sessionId },
                 { status: "connected", ...(phone ? { phoneNumber: phone } : {}) }
-              ).catch(() => {});
+              ).catch(() => { });
             }
             continue;
           }
@@ -3022,11 +3237,11 @@ class WhatsAppService {
           const lastAttempt = this.reconnectCooldown.get(s.sessionId) || 0;
           if (Date.now() - lastAttempt > 45000) {
             console.log(`[WA WATCHDOG] Auto-reconnecting dropped session ${s.sessionId} (attempt ${attempts + 1}/${this.MAX_AUTO_RECONNECT_ATTEMPTS})...`);
-            await this.reconnectSession(s.sessionId).catch(() => {});
+            await this.reconnectSession(s.sessionId).catch(() => { });
             await new Promise((resolve) => setTimeout(resolve, 2000));
           }
         }
-      } catch (e) {}
+      } catch (e) { }
     }, 60000);
   }
 
@@ -3059,7 +3274,7 @@ class WhatsAppService {
         SessionModel.updateOne(
           { sessionId },
           { status: "connected", lastError: "", ...(phoneNumber ? { phoneNumber } : {}) }
-        ).catch(() => {});
+        ).catch(() => { });
       }
     } else if (hasPendingQR) {
       status = "qr";
@@ -3134,7 +3349,7 @@ class WhatsAppService {
       }
       this.io.to(sessionId).emit("session:update", payload);
       return true;
-    } catch (e) {}
+    } catch (e) { }
 
     return false;
   }
@@ -3230,7 +3445,7 @@ class WhatsAppService {
       await waitForSocketOpenWithTimeout(sock);
       // Give a tiny grace period for noise handshake to complete
       await new Promise(resolve => setTimeout(resolve, 1500));
-      
+
       console.log(`[WA PAIRING] Requesting pairing code for session ${sessionId} and phone ${phoneNumber}`);
       const code = await sock.requestPairingCode(phoneNumber);
       return code;
@@ -3249,7 +3464,7 @@ class WhatsAppService {
     try {
       await waitForSocketOpenWithTimeout(sock);
       const group = await sock.groupCreate(subject, participants);
-      
+
       if (group && group.id) {
         // 1. Edit Group Settings (locked = only admins, unlocked = all members)
         if (options.editGroupSettings !== undefined) {
@@ -3334,7 +3549,7 @@ class WhatsAppService {
           }
         }
       }
-      
+
       return group;
     } catch (err) {
       console.error(`[WA GROUPS] Failed to create group "${subject}":`, err);
@@ -3376,7 +3591,7 @@ class WhatsAppService {
     const participantJids = Array.from(new Set(cleanNumbers)).map(num => `${num}@s.whatsapp.net`);
 
     const limit = Math.max(1, Math.min(1024, Number(maxMembersPerGroup) || 100));
-    
+
     let groupTasks = [];
     const subjectsArray = Array.isArray(subjects) ? subjects.map(s => String(s).trim()).filter(Boolean) : [String(subjects).trim()];
 
@@ -3436,20 +3651,20 @@ class WhatsAppService {
 
           if (options.editGroupSettings !== undefined) {
             const restrictMode = options.editGroupSettings === false ? 'locked' : 'unlocked';
-            await creatorSock.groupSettingUpdate(group.id, restrictMode).catch(() => {});
+            await creatorSock.groupSettingUpdate(group.id, restrictMode).catch(() => { });
           }
 
           if (options.sendNewMessages !== undefined) {
             const announceMode = options.sendNewMessages === false ? 'announcement' : 'not_announcement';
-            await creatorSock.groupSettingUpdate(group.id, announceMode).catch(() => {});
+            await creatorSock.groupSettingUpdate(group.id, announceMode).catch(() => { });
           }
 
           if (options.memberAddMode) {
-            await creatorSock.groupMemberAddMode(group.id, options.memberAddMode).catch(() => {});
+            await creatorSock.groupMemberAddMode(group.id, options.memberAddMode).catch(() => { });
           }
 
           if (options.joinApprovalMode) {
-            await creatorSock.groupJoinApprovalMode(group.id, options.joinApprovalMode).catch(() => {});
+            await creatorSock.groupJoinApprovalMode(group.id, options.joinApprovalMode).catch(() => { });
           }
         }
 
@@ -3549,7 +3764,7 @@ class WhatsAppService {
 
     for (let i = 0; i < participantJids.length; i += batchSize) {
       const chunk = participantJids.slice(i, i + batchSize);
-      
+
       if (i > 0) {
         await sleep(2000);
       }
@@ -3709,7 +3924,7 @@ class WhatsAppService {
       throw new Error("No connected WhatsApp account available to inspect group invite link.");
     }
 
-    await waitForSocketOpenWithTimeout(sock, 5000).catch(() => {});
+    await waitForSocketOpenWithTimeout(sock, 5000).catch(() => { });
     try {
       const info = await sock.groupGetInviteInfo(code);
       const jid = info.id ? (info.id.includes("@") ? info.id : `${info.id}@g.us`) : "";
@@ -3720,7 +3935,7 @@ class WhatsAppService {
           if (fullMeta && Array.isArray(fullMeta.participants) && fullMeta.participants.length > 0) {
             participants = fullMeta.participants;
           }
-        } catch (e) {}
+        } catch (e) { }
       }
       return {
         id: jid,
@@ -3760,7 +3975,7 @@ class WhatsAppService {
       throw new Error("WhatsApp account is not connected.");
     }
 
-    await waitForSocketOpenWithTimeout(sock, 5000).catch(() => {});
+    await waitForSocketOpenWithTimeout(sock, 5000).catch(() => { });
 
     try {
       let groupJid = null;
@@ -3769,7 +3984,7 @@ class WhatsAppService {
         if (info?.id) {
           groupJid = info.id.includes("@") ? info.id : `${info.id}@g.us`;
         }
-      } catch (e) {}
+      } catch (e) { }
 
       const res = await sock.groupAcceptInvite(code);
       const finalJid = res ? (res.includes("@") ? res : `${res}@g.us`) : groupJid;
@@ -3789,7 +4004,7 @@ class WhatsAppService {
           if (info?.id) {
             return info.id.includes("@") ? info.id : `${info.id}@g.us`;
           }
-        } catch (e) {}
+        } catch (e) { }
         return null;
       }
       console.error(`[WhatsAppService] joinGroupViaInvite error for code ${code}:`, err);
@@ -3820,7 +4035,7 @@ class WhatsAppService {
     const sock = this.sockets.get(sessionId);
     if (!sock || !Array.isArray(jids) || jids.length === 0) return {};
 
-    await waitForSocketOpenWithTimeout(sock, 4000).catch(() => {});
+    await waitForSocketOpenWithTimeout(sock, 4000).catch(() => { });
 
     const results = {};
     const chunkSize = 8;
@@ -3838,9 +4053,12 @@ class WhatsAppService {
             if (url) {
               results[jid] = url;
             }
-          } catch (e) {}
+          } catch (e) { }
         })
       );
+      if (i + chunkSize < jids.length) {
+        await new Promise((r) => setTimeout(r, 100));
+      }
     }
     return results;
   }
@@ -3869,7 +4087,7 @@ class WhatsAppService {
       reason: "deleted",
       userId: sessionDoc?.userId || null,
     });
-    await SessionModel.deleteOne({ sessionId }).catch(() => {});
+    await SessionModel.deleteOne({ sessionId }).catch(() => { });
 
     if (this.io) {
       const deletedPayload = {

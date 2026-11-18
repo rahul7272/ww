@@ -35,24 +35,53 @@ export function validateEnvironment() {
   }
 
   // 4. Base URL / Public URL Consistency
-  const baseUrl = process.env.PUBLIC_BASE_URL || process.env.BASE_URL || process.env.BACKEND_URL;
-  if (!baseUrl) {
+  const baseUrl = process.env.PUBLIC_BASE_URL || process.env.BASE_URL || process.env.BACKEND_URL || "http://localhost:3000";
+  if (!process.env.BASE_URL && !process.env.PUBLIC_BASE_URL && !process.env.BACKEND_URL) {
     warnings.push("Neither PUBLIC_BASE_URL, BASE_URL, nor BACKEND_URL is set. Defaulting to 'http://localhost:3000'.");
   } else if (!/^https?:\/\//i.test(baseUrl)) {
     warnings.push(`Configured BASE_URL "${baseUrl}" does not begin with http:// or https://.`);
   }
 
-  // 5. Firebase Authentication
+  // Canonicalize URL environment variables so all services receive a consistent value
+  process.env.BASE_URL = process.env.BASE_URL || baseUrl;
+  process.env.BACKEND_URL = process.env.BACKEND_URL || baseUrl;
+  process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || baseUrl;
+  process.env.API_ORIGIN = process.env.API_ORIGIN || baseUrl;
+  process.env.REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+
+  // 5. Campaign & Queue Operational Limits
+  const defaultDelay = parseInt(process.env.DEFAULT_MESSAGE_DELAY || "2000", 10);
+  const minDelay = parseInt(process.env.MIN_MESSAGE_DELAY || "1000", 10);
+  const maxDelay = parseInt(process.env.MAX_MESSAGE_DELAY || "5000", 10);
+  const maxCampaignSize = parseInt(process.env.MAX_CAMPAIGN_SIZE || "1000", 10);
+  const maxSessionQueueDepth = parseInt(process.env.MAX_SESSION_QUEUE_DEPTH || "200", 10);
+  const maxConcurrentCampaigns = parseInt(process.env.MAX_CONCURRENT_CAMPAIGNS || "5", 10);
+
+  // Set normalized integers on process.env if absent
+  process.env.DEFAULT_MESSAGE_DELAY = String(defaultDelay);
+  process.env.MIN_MESSAGE_DELAY = String(minDelay);
+  process.env.MAX_MESSAGE_DELAY = String(maxDelay);
+  process.env.MAX_CAMPAIGN_SIZE = String(maxCampaignSize);
+  process.env.MAX_SESSION_QUEUE_DEPTH = String(maxSessionQueueDepth);
+  process.env.MAX_CONCURRENT_CAMPAIGNS = String(maxConcurrentCampaigns);
+
+  // 6. Firebase Authentication
   const hasFirebaseAdmin = Boolean(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY);
   const hasFirebaseWeb = Boolean(process.env.FIREBASE_WEB_API_KEY || process.env.FIREBASE_API_KEY);
   if (!hasFirebaseAdmin && !hasFirebaseWeb) {
     warnings.push("Firebase authentication credentials (Admin SDK or FIREBASE_WEB_API_KEY) are not set. Google login verification will fail.");
   }
 
-  // 6. Meta / WhatsApp / Instagram Integration
+  // 7. Meta / WhatsApp / Instagram Integration
   const metaAppId = process.env.META_APP_ID;
   if (metaAppId === "your_meta_app_id") {
     warnings.push("META_APP_ID is using placeholder value 'your_meta_app_id'.");
+  }
+
+  // 8. AI & LLM Service Configuration
+  const openRouterKey = process.env.OPENROUTER_API_KEY;
+  if (!openRouterKey || openRouterKey === "your_openrouter_api_key") {
+    warnings.push("OPENROUTER_API_KEY is not configured or using placeholder. AI auto-reply agent features will require configuration in settings.");
   }
 
   // Output Warnings

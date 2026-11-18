@@ -22,7 +22,16 @@ const campaignSchema = new mongoose.Schema({
   },
   message: {
     type: String,
-    required: true,
+    required: false,
+  },
+  templateId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "WhatsAppTemplate",
+  },
+  templateVariables: {
+    type: Map,
+    of: String,
+    default: {},
   },
   numberListId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -158,6 +167,7 @@ const campaignSchema = new mongoose.Schema({
   resumedAt: Date,
   completedAt: Date,
   failedAt: Date,
+  lastError: { type: String },
 
   createdAt: {
     type: Date,

@@ -32,3 +32,11 @@ export { default as CompanyBillingSettings } from "./CompanyBillingSettings.js";
 export { default as Invoice } from "./Invoice.js";
 export { default as MediaSettings } from "./MediaSettings.js";
 export { default as QuickReply } from "./QuickReply.js";
+export { default as WhatsAppTemplate } from "./WhatsAppTemplate.js";
+export { default as PrebuiltTemplate } from "./PrebuiltTemplate.js";
+export { default as OtpLog } from "./OtpLog.js";
+export { default as TemplateLog } from "./TemplateLog.js";
+export { default as WhatsAppAutomationRule } from "./WhatsAppAutomationRule.js";
+export { default as AgentTeam } from "./AgentTeam.js";
+export { default as WhatsAppAutomationState } from "./WhatsAppAutomationState.js";
+

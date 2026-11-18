@@ -1,13 +1,25 @@
 import { WhatsAppSession, Message } from "../models/index.js";
 import CampaignService from "../services/CampaignService.js";
 import mongoose from "mongoose";
-import { writeFileSync, unlinkSync } from "fs";
+import { promises as fsPromises } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
+import NodeCache from "node-cache";
 import { sendSubscriptionError } from "../utils/subscription.js";
+
+// Idempotency cache: stores completed responses and in-progress requests for 30 minutes
+const idempotencyCache = new NodeCache({
+  stdTTL: 30 * 60, // 30 minutes
+  checkperiod: 120,
+  useClones: false,
+});
 
 export const sendMessage = async (req, res) => {
   let tempFilePath = null;
+  const idempotencyKey =
+    req.headers["idempotency-key"] ||
+    req.headers["x-idempotency-key"] ||
+    req.body?.idempotencyKey;
 
   try {
     const body = req.body;
@@ -16,7 +28,7 @@ export const sendMessage = async (req, res) => {
     //   Internal/legacy: { sessionId, phoneNumber, message, contactName }
     const sessionId = body.sessionId || body.session;
     const phoneNumber = body.phoneNumber || body.to;
-    const { message, contactName, mediaBase64, mediaType, mediaName } = body;
+    const { message, contactName, mediaBase64, mediaType, mediaName, ttlMs } = body;
 
     if (!sessionId || !phoneNumber || !message) {
       return res
@@ -27,6 +39,24 @@ export const sendMessage = async (req, res) => {
         });
     }
 
+    // Verify idempotency cache to protect against duplicate retry storms
+    if (idempotencyKey) {
+      const cached = idempotencyCache.get(idempotencyKey);
+      if (cached) {
+        if (cached.status === "processing") {
+          return res.status(409).json({
+            success: false,
+            code: "IDEMPOTENT_OPERATION_IN_PROGRESS",
+            error: "A request with this idempotency key is currently being processed.",
+          });
+        }
+        if (cached.status === "completed") {
+          return res.json(cached.response);
+        }
+      }
+      idempotencyCache.set(idempotencyKey, { status: "processing", startedAt: Date.now() });
+    }
+
     let mediaPath = null;
 
     // Handle base64 encoded media
@@ -35,19 +65,25 @@ export const sendMessage = async (req, res) => {
         // Convert base64 to buffer
         const buffer = Buffer.from(mediaBase64, "base64");
 
-        // Create temp file
+        // Create temp file asynchronously without blocking the event loop
         tempFilePath = join(
           tmpdir(),
           `whatsapp-media-${Date.now()}-${mediaName || "file"}`,
         );
-        writeFileSync(tempFilePath, buffer);
+        await fsPromises.writeFile(tempFilePath, buffer);
 
         mediaPath = tempFilePath;
       } catch (err) {
+        if (idempotencyKey) idempotencyCache.del(idempotencyKey);
         return res
           .status(400)
           .json({ error: `Failed to process media: ${err.message}` });
       }
+    }
+
+    const sendOptions = {};
+    if (ttlMs && Number(ttlMs) > 0) {
+      sendOptions.ttlMs = Number(ttlMs);
     }
 
     try {
@@ -59,27 +95,54 @@ export const sendMessage = async (req, res) => {
         contactName,
         mediaPath,
         mediaType,
+        sendOptions,
       );
+
+      if (idempotencyKey) {
+        idempotencyCache.set(idempotencyKey, { status: "completed", response: result });
+      }
 
       res.json(result);
     } finally {
-      // Clean up temp file
+      // Clean up temp file asynchronously
       if (tempFilePath) {
         try {
-          unlinkSync(tempFilePath);
+          await fsPromises.unlink(tempFilePath);
         } catch (err) {
           console.error("Failed to clean up temp file:", err.message);
         }
       }
     }
   } catch (err) {
+    if (idempotencyKey) {
+      idempotencyCache.del(idempotencyKey);
+    }
+
     if (tempFilePath) {
       try {
-        unlinkSync(tempFilePath);
+        await fsPromises.unlink(tempFilePath);
       } catch (e) {
         console.error("Failed to clean up temp file:", e.message);
       }
     }
+
+    if (err.status === 429 || err.code === "QUEUE_FULL") {
+      return res.status(429).set("Retry-After", String(err.retryAfter || 5)).json({
+        success: false,
+        code: "QUEUE_FULL",
+        error: err.message,
+        retryAfter: err.retryAfter || 5,
+      });
+    }
+
+    if (err.code === "QUEUE_TIMEOUT") {
+      return res.status(504).json({
+        success: false,
+        code: "QUEUE_TIMEOUT",
+        error: err.message,
+      });
+    }
+
     return sendSubscriptionError(res, err, "Failed to send message");
   }
 };

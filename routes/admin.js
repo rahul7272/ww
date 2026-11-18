@@ -4,6 +4,7 @@ import bcrypt from "bcryptjs";
 import authMiddleware from "../middleware/auth.js";
 import User from "../models/User.js";
 import WhatsAppSession from "../models/WhatsAppSession.js";
+import WhatsAppGroup from "../models/WhatsAppGroup.js";
 import WhatsAppAuthState from "../models/WhatsAppAuthState.js";
 import Message from "../models/Message.js";
 import Campaign from "../models/Campaign.js";
@@ -18,7 +19,13 @@ import MetaSystemSettings from "../meta/models/MetaSystemSettings.js";
 import GoogleOAuthSettings from "../models/GoogleOAuthSettings.js";
 import Flow from "../models/Flow.js";
 import WhatsAppService from "../services/WhatsAppService.js";
+import CampaignService from "../services/CampaignService.js";
 import SubscriptionService from "../services/SubscriptionService.js";
+import dripService from "../services/DripService.js";
+import { getBullMQTelemetry } from "../queues/templateQueue.js";
+import { getOtpWorkerMetrics } from "../workers/otpWorker.js";
+import storageHelper from "../utils/storageHelper.js";
+import StorageCleanupLog from "../models/StorageCleanupLog.js";
 
 const router = express.Router();
 
@@ -53,6 +60,100 @@ function maskSecret(secret = "") {
   return `${secret.slice(0, 2)}••••${secret.slice(-2)}`;
 }
 
+// ── System Health & Real-Time Queue Telemetry ──────────────────────────────
+router.get("/system-health", authMiddleware, async (req, res) => {
+  try {
+    if (!ensureAdmin(req, res)) return;
+
+    const mem = process.memoryUsage();
+    const formatMB = (bytes) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+
+    // Fetch aggregated WhatsApp socket queue telemetry & backpressure stats (Phase 3 - Task 3.1)
+    const waQueueStats = WhatsAppService.getQueueStats
+      ? WhatsAppService.getQueueStats()
+      : {
+          totalQueuedTasks: 0,
+          maxPerSessionCapacity: WhatsAppService.MAX_SESSION_QUEUE_DEPTH,
+          activeQueuesCount: 0,
+          sessionDepths: {},
+          rejectedTasksCount: 0,
+          expiredTasksCount: 0,
+          totalEnqueuedTasks: 0,
+        };
+
+    // Fetch live BullMQ queue distribution metrics (Phase 3 - Task 3.1)
+    const bullmqStats = await getBullMQTelemetry();
+
+    // Fetch worker & scheduler telemetry
+    const otpWorkerStats = getOtpWorkerMetrics ? getOtpWorkerMetrics() : null;
+    const dripTelemetry = dripService.getTelemetry ? dripService.getTelemetry() : null;
+
+    const activeCampaignsCount = CampaignService.activeCampaigns?.size || 0;
+
+    const targetEmail = req.query.email ? String(req.query.email).trim().toLowerCase() : null;
+    let queriedUserInfo = null;
+    if (targetEmail) {
+      const targetUser = await User.findOne({ email: targetEmail }).select("-password").lean();
+      if (targetUser) {
+        queriedUserInfo = {
+          userId: targetUser._id,
+          email: targetUser.email,
+          role: targetUser.role,
+          name: targetUser.name || "",
+          createdAt: targetUser.createdAt,
+        };
+      } else {
+        queriedUserInfo = { email: targetEmail, found: false };
+      }
+    }
+
+    res.json({
+      success: true,
+      timestamp: new Date().toISOString(),
+      admin: {
+        email: req.user?.email || "unknown",
+        role: req.user?.role || "admin",
+        ...(queriedUserInfo ? { queriedUser: queriedUserInfo } : {}),
+      },
+      uptimeSeconds: Math.floor(process.uptime()),
+      cpu: {
+        usageMicroseconds: process.cpuUsage(),
+        uptimeSeconds: Math.floor(process.uptime()),
+      },
+      database: {
+        readyState: mongoose.connection.readyState,
+        status: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+      },
+      memory: {
+        heapUsed: formatMB(mem.heapUsed),
+        heapTotal: formatMB(mem.heapTotal),
+        rss: formatMB(mem.rss),
+        external: formatMB(mem.external),
+      },
+      queues: {
+        totalQueuedTasks: waQueueStats.totalQueuedTasks,
+        maxPerSessionCapacity: waQueueStats.maxPerSessionCapacity,
+        activeQueuesCount: waQueueStats.activeQueuesCount,
+        sessionDepths: waQueueStats.sessionDepths,
+        rejectedTasksCount: waQueueStats.rejectedTasksCount,
+        expiredTasksCount: waQueueStats.expiredTasksCount,
+        totalEnqueuedTasks: waQueueStats.totalEnqueuedTasks,
+        bullmq: bullmqStats,
+      },
+      workloads: {
+        activeCampaigns: activeCampaignsCount,
+        maxConcurrentCampaigns: CampaignService.MAX_CONCURRENT_CAMPAIGNS,
+        activeWhatsAppSockets: WhatsAppService.sockets?.size || 0,
+        activeSessionsInWatchdog: WhatsAppService.reconnectAttempts?.size || 0,
+        otpWorker: otpWorkerStats,
+        dripService: dripTelemetry,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Overview Dashboard ────────────────────────────────────────────────────────
 router.get("/overview", authMiddleware, async (req, res) => {
   try {
@@ -70,6 +171,7 @@ router.get("/overview", authMiddleware, async (req, res) => {
       recentMessageCount,
       totalApiKeys,
       activeApiKeys,
+      groupStats,
     ] = await Promise.all([
       User.countDocuments(),
       User.countDocuments({ createdAt: { $gte: since } }),
@@ -79,7 +181,19 @@ router.get("/overview", authMiddleware, async (req, res) => {
       Message.countDocuments({ createdAt: { $gte: since } }),
       ApiKey.countDocuments(),
       ApiKey.countDocuments({ status: "active" }),
+      WhatsAppGroup.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalGroups: { $sum: 1 },
+            totalMembers: { $sum: "$participantCount" },
+          },
+        },
+      ]),
     ]);
+
+    const totalGroups = groupStats[0]?.totalGroups || 0;
+    const totalGroupMembers = groupStats[0]?.totalMembers || 0;
 
     // 7-day daily message chart
     const dailyMsgs = await Message.aggregate([
@@ -263,6 +377,8 @@ router.get("/overview", authMiddleware, async (req, res) => {
           totalMessages,
           activeApiKeys,
           totalApiKeys,
+          totalGroups,
+          totalGroupMembers,
         },
         dailyChart,
         apiChart,
@@ -581,13 +697,36 @@ router.get("/sessions", authMiddleware, async (req, res) => {
       .lean();
 
     const sessionIds = sessions.map((s) => s._id);
-    const msgCounts = await Message.aggregate([
-      { $match: { sessionId: { $in: sessionIds } } },
-      { $group: { _id: "$sessionId", count: { $sum: 1 } } },
+    const stringSessionIds = sessions.map((s) => s.sessionId);
+
+    const [msgCounts, groupCounts] = await Promise.all([
+      Message.aggregate([
+        { $match: { sessionId: { $in: sessionIds } } },
+        { $group: { _id: "$sessionId", count: { $sum: 1 } } },
+      ]),
+      WhatsAppGroup.aggregate([
+        { $match: { sessionId: { $in: stringSessionIds } } },
+        {
+          $group: {
+            _id: "$sessionId",
+            groupCount: { $sum: 1 },
+            memberCount: { $sum: "$participantCount" },
+          },
+        },
+      ]),
     ]);
+
     const msgMap = {};
     msgCounts.forEach((m) => {
       msgMap[String(m._id)] = m.count;
+    });
+
+    const groupMap = {};
+    groupCounts.forEach((g) => {
+      groupMap[String(g._id)] = {
+        groups: g.groupCount,
+        members: g.memberCount,
+      };
     });
 
     const rows = sessions.map((s) => ({
@@ -598,6 +737,8 @@ router.get("/sessions", authMiddleware, async (req, res) => {
       status: s.status,
       user: s.userId,
       messages: msgMap[String(s._id)] || 0,
+      groups: groupMap[String(s.sessionId)]?.groups || 0,
+      members: groupMap[String(s.sessionId)]?.members || 0,
       lastConnected: s.lastConnected,
       createdAt: s.createdAt,
     }));
@@ -608,11 +749,21 @@ router.get("/sessions", authMiddleware, async (req, res) => {
       ["connecting", "pending"].includes(s.status),
     ).length;
 
+    const totalPlatformGroups = Object.values(groupMap).reduce((acc, g) => acc + g.groups, 0);
+    const totalPlatformMembers = Object.values(groupMap).reduce((acc, g) => acc + g.members, 0);
+
     res.json({
       success: true,
       data: {
         sessions: rows,
-        stats: { total: rows.length, connected, disconnected, connecting },
+        stats: {
+          total: rows.length,
+          connected,
+          disconnected,
+          connecting,
+          totalGroups: totalPlatformGroups,
+          totalMembers: totalPlatformMembers,
+        },
       },
     });
   } catch (err) {
@@ -1224,6 +1375,148 @@ router.put("/media-settings", authMiddleware, async (req, res) => {
     );
     invalidateMediaSettingsCache();
     res.json({ success: true, data: settings });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+// ── VPS Storage & Media Retention Management ──────────────────────────────────
+router.get("/storage-stats", authMiddleware, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+  try {
+    const stats = await storageHelper.getFullStorageStats();
+    res.json({ success: true, data: stats });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get("/storage-logs", authMiddleware, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+  try {
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(5, parseInt(req.query.limit, 10) || 20));
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (req.query.category && req.query.category !== "all") {
+      filter.targetCategory = req.query.category;
+    }
+    if (req.query.triggerType && req.query.triggerType !== "all") {
+      filter.triggerType = req.query.triggerType;
+    }
+
+    const [logs, totalCount, summaryAgg] = await Promise.all([
+      StorageCleanupLog.find(filter).sort({ executedAt: -1 }).skip(skip).limit(limit).lean(),
+      StorageCleanupLog.countDocuments(filter),
+      StorageCleanupLog.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalFiles: { $sum: "$filesDeleted" },
+            totalBytes: { $sum: "$bytesFreed" },
+          },
+        },
+      ]),
+    ]);
+
+    const totalFiles = summaryAgg[0]?.totalFiles || 0;
+    const totalBytes = summaryAgg[0]?.totalBytes || 0;
+
+    res.json({
+      success: true,
+      data: {
+        logs,
+        pagination: {
+          page,
+          limit,
+          totalCount,
+          totalPages: Math.ceil(totalCount / limit) || 1,
+        },
+        summary: {
+          totalLifetimeFilesDeleted: totalFiles,
+          totalLifetimeBytesFreed: totalBytes,
+          totalLifetimeSizeFreed: storageHelper.formatBytes(totalBytes),
+          totalLogsCount: totalCount,
+        },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.post("/clean-media", authMiddleware, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+  try {
+    const { targetType = "all", daysOlderThan = null, allTime = false } = req.body;
+    const result = await storageHelper.executeMediaCleanup({
+      targetType,
+      daysOlderThan,
+      allTime,
+      triggerType: "manual_admin",
+      adminEmail: req.user?.email || "admin",
+    });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.put("/storage-category-rules", authMiddleware, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+  try {
+    const { categoryRetention, autoCleanupEnabled } = req.body;
+    const update = {};
+
+    if (autoCleanupEnabled !== undefined) {
+      update.autoCleanupEnabled = Boolean(autoCleanupEnabled);
+    }
+
+    if (categoryRetention && typeof categoryRetention === "object") {
+      const validCategories = ["video", "image", "audio", "document", "other"];
+      for (const cat of validCategories) {
+        if (categoryRetention[cat]) {
+          if (categoryRetention[cat].enabled !== undefined) {
+            update[`categoryRetention.${cat}.enabled`] = Boolean(categoryRetention[cat].enabled);
+          }
+          if (categoryRetention[cat].days !== undefined) {
+            update[`categoryRetention.${cat}.days`] = Math.max(0, parseInt(categoryRetention[cat].days, 10) || 0);
+          }
+        }
+      }
+    }
+
+    const settings = await MediaSettings.findOneAndUpdate(
+      { key: "global" },
+      { $set: update },
+      { upsert: true, new: true }
+    );
+
+    res.json({
+      success: true,
+      message: "Per-category retention rules saved successfully",
+      data: settings,
+    });
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message });
+  }
+});
+
+router.put("/storage-retention", authMiddleware, async (req, res) => {
+  if (!ensureAdmin(req, res)) return;
+  try {
+    const { retentionDays, autoCleanupEnabled } = req.body;
+    const update = {};
+    if (retentionDays !== undefined) update.retentionDays = Math.max(0, parseInt(retentionDays, 10) || 0);
+    if (autoCleanupEnabled !== undefined) update.autoCleanupEnabled = Boolean(autoCleanupEnabled);
+
+    const settings = await MediaSettings.findOneAndUpdate(
+      { key: "global" },
+      { $set: update },
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, message: "Storage retention policy saved", data: settings });
   } catch (err) {
     res.status(400).json({ success: false, error: err.message });
   }

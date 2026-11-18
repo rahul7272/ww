@@ -3,6 +3,7 @@ import InstagramProcessedComment from "../instagram/models/InstagramProcessedCom
 import InstagramAiAgent from "../instagram/models/InstagramAiAgent.js";
 import { generateAndPostReply } from "../instagram/controllers/instagramAiAgentController.js";
 import MetaSystemSettings from "../meta/models/MetaSystemSettings.js";
+import { addWebhookJob } from "../queues/templateQueue.js";
 
 // GET /api/webhook - verification for Meta
 export async function verifyWebhook(req, res) {
@@ -31,19 +32,29 @@ export async function verifyWebhook(req, res) {
 // POST /api/webhook - receives events from Meta
 export async function receiveWebhook(req, res) {
   try {
-    // Acknowledge immediately to Meta (Response-first pattern)
+    // 1. Acknowledge immediately to Meta within ~5ms (Response-first pattern)
     res.status(200).send("EVENT_RECEIVED");
+
+    // 2. Buffer into BullMQ queue to protect Node.js event loop & DB connection pool
+    const enqueued = await addWebhookJob("process_meta_instagram_webhook", { body: req.body });
+    if (!enqueued) {
+      // Graceful fallback: If Redis is unreachable, process asynchronously via microtask queue
+      setImmediate(() => {
+        processInstagramWebhookPayload(req.body).catch((err) => {
+          console.error("[webhook.fallback:instagram]", err.message || err);
+        });
+      });
+    }
   } catch (err) {
-    // If we cannot even acknowledge, return 500
     console.error("[webhook.receive:ack]", err.message || err);
     return res.status(500).send("Error");
   }
+}
 
-  // Process payload asynchronously
-  (async function processPayload() {
-    try {
-      const body = req.body || {};
-      if (!body.entry || !Array.isArray(body.entry)) return;
+// Internal asynchronous processor for Instagram events
+export async function processInstagramWebhookPayload(body = {}) {
+  try {
+    if (!body || !body.entry || !Array.isArray(body.entry)) return;
 
       for (const entry of body.entry) {
         // page or page id is usually in entry.id
@@ -248,5 +259,4 @@ export async function receiveWebhook(req, res) {
     } catch (err) {
       console.error("[webhook.processPayload]", err.message || err);
     }
-  })();
 }

@@ -11,6 +11,7 @@ import reminderService from "../services/ReminderService.js";
 import { META_AI_JID, META_AI_NORMALIZED_JID, isMetaAiJid, resolveMetaAiBot, onUserSentMessage } from "../services/MetaAiService.js";
 import { cleanupUnusedChatMediaUrls } from "../utils/sessionLifecycle.js";
 import { findMatchingCrmRecords } from "../utils/crmChatLink.js";
+import SubscriptionService from "../services/SubscriptionService.js";
 
 /**
  * Verifies the authenticated user owns the requested WhatsApp session.
@@ -204,8 +205,10 @@ export const getChatList = async (req, res) => {
       limit,
     });
 
-    // Ensure ALL participating WhatsAppGroup docs for THIS session are mirrored into WaChat
-    if (!search && (tab === "all" || tab === "groups")) {
+    // Ensure ALL participating WhatsAppGroup docs for THIS session are mirrored into WaChat (throttled to once/60s to avoid redundant DB counts)
+    const lastGroupReconcile = lastGroupSyncMap.get(`reconcile_${sessionId}`) || 0;
+    if (!search && (tab === "all" || tab === "groups") && Date.now() - lastGroupReconcile > 60000) {
+      lastGroupSyncMap.set(`reconcile_${sessionId}`, Date.now());
       try {
         const [waGroupCount, waChatGroupCount] = await Promise.all([
           WhatsAppGroup.countDocuments({ userId: req.user._id, sessionId }),
@@ -646,6 +649,21 @@ export const sendChatMessage = async (req, res) => {
         return res.status(400).json({
           error: `File size too large! The maximum allowed size for ${typeLabel}s is ${maxAllowedMB} MB (your file is ${uploadedMB.toFixed(1)} MB). Please select a smaller file.`,
         });
+      }
+
+      if (req.user) {
+        try {
+          await SubscriptionService.assertStorageLimit(req.user, file.size || 0);
+        } catch (storageErr) {
+          try {
+            if (existsSync(file.path)) rmSync(file.path);
+          } catch (_) {}
+          return res.status(403).json({
+            error: storageErr.message || "Storage limit exceeded for your subscription plan.",
+            details: storageErr.details,
+            code: "STORAGE_LIMIT_EXCEEDED",
+          });
+        }
       }
 
       mediaPath = file.path;
@@ -1627,6 +1645,20 @@ export const createChatReminder = async (req, res) => {
     let mediaType = req.body.mediaType || "";
 
     if (req.file) {
+      if (req.user) {
+        try {
+          await SubscriptionService.assertStorageLimit(req.user, req.file.size || 0);
+        } catch (storageErr) {
+          try {
+            if (existsSync(req.file.path)) rmSync(req.file.path);
+          } catch (_) {}
+          return res.status(403).json({
+            error: storageErr.message || "Storage limit exceeded for your subscription plan.",
+            details: storageErr.details,
+            code: "STORAGE_LIMIT_EXCEEDED",
+          });
+        }
+      }
       mediaUrl = `/uploads/${req.file.filename}`;
       mediaType = req.file.mimetype;
     }

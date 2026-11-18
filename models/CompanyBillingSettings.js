@@ -44,6 +44,7 @@ const companyBillingSettingsSchema = new mongoose.Schema(
     signatureUrl: { type: String, default: "" },
 
     // Invoice Defaults
+    defaultTemplateId: { type: String, default: "template-1", trim: true },
     invoicePrefix: { type: String, default: "INV-", trim: true },
     nextInvoiceNumber: { type: Number, default: 1001 },
     defaultDueDays: { type: Number, default: 15 },
@@ -57,6 +58,12 @@ const companyBillingSettingsSchema = new mongoose.Schema(
       default:
         "Thank you for choosing us as your WhatsApp Business API & Digital Solutions partner!",
     },
+
+    // WhatsApp Due Date Reminders & Alerts
+    autoRemindDueSoon: { type: Boolean, default: true }, // 2 days before
+    autoRemindDueDate: { type: Boolean, default: true }, // on due date
+    autoRemindOverdue: { type: Boolean, default: true }, // overdue
+    autoAttachPdf: { type: Boolean, default: true }, // auto attach PDF
   },
   { timestamps: true }
 );

@@ -38,12 +38,16 @@ class ValidatorTaskService {
   async createTask(userId, payload) {
     const {
       name,
+      notes = '',
       numbers = [],
       sessionIds = [],
       batchSize = 10,
       delaySeconds = 2,
       defaultCountryCode = '91',
       autoRemoveInvalid = false,
+      safetyProfile = 'balanced',
+      safetyCooldownSeconds = 5,
+      safetyCooldownEvery = 50,
     } = payload;
 
     if (!Array.isArray(numbers) || numbers.length === 0) {
@@ -102,9 +106,23 @@ class ValidatorTaskService {
     const effectiveDelay = Math.max(1, Math.min(Number(delaySeconds) || 2, 30));
     const totalBatches = Math.ceil(parsedNumbers.length / effectiveBatchSize);
 
+    const initialActivityNotes = [];
+    if (notes && String(notes).trim()) {
+      initialActivityNotes.push({
+        text: String(notes).trim(),
+        author: 'Admin',
+        createdAt: new Date(),
+      });
+    }
+
     const task = new ValidatorTask({
       userId,
       name: (name || '').trim() || `Validation Task (${parsedNumbers.length} numbers)`,
+      notes: (notes || '').trim(),
+      activityNotes: initialActivityNotes,
+      safetyProfile: safetyProfile || 'balanced',
+      safetyCooldownSeconds: Math.max(0, Math.min(Number(safetyCooldownSeconds) || 5, 60)),
+      safetyCooldownEvery: Math.max(10, Math.min(Number(safetyCooldownEvery) || 50, 500)),
       selectedSessions: resolvedSessions,
       batchSize: effectiveBatchSize,
       delaySeconds: effectiveDelay,
@@ -150,6 +168,9 @@ class ValidatorTaskService {
       const sessions = task.selectedSessions || [];
       const batchSize = Math.max(1, task.batchSize || 10);
       const delayMs = Math.max(500, (task.delaySeconds || 2) * 1000);
+      const safetyCooldownMs = Math.max(0, (task.safetyCooldownSeconds || 5) * 1000);
+      const safetyCooldownEvery = Math.max(10, task.safetyCooldownEvery || 50);
+      let totalNumbersChecked = 0;
 
       let batchIndex = 0;
 
@@ -298,9 +319,23 @@ class ValidatorTaskService {
 
         await ValidatorTask.updateOne({ _id: taskId }, { $set: updateFields });
 
+        totalNumbersChecked += pendingIndexes.length;
+
         // Check if more pending numbers remain before pausing for precaution delay
         if (pending > 0 && !controlState.abort && !controlState.paused) {
-          await new Promise((r) => setTimeout(r, delayMs));
+          // Anti-ban safety cooldown pause after every N numbers
+          if (
+            safetyCooldownMs > 0 &&
+            totalNumbersChecked >= safetyCooldownEvery &&
+            totalNumbersChecked % safetyCooldownEvery < batchSize
+          ) {
+            console.log(
+              `[ValidatorTask] Task ${taskIdStr}: Enforcing anti-ban safety cooldown pause of ${task.safetyCooldownSeconds || 5}s after ${totalNumbersChecked} numbers.`
+            );
+            await new Promise((r) => setTimeout(r, safetyCooldownMs));
+          } else {
+            await new Promise((r) => setTimeout(r, delayMs));
+          }
         }
       }
 
@@ -340,7 +375,7 @@ class ValidatorTaskService {
   async listTasks(userId, limit = 30) {
     return ValidatorTask.find({ userId })
       .sort({ createdAt: -1 })
-      .select('name status selectedSessions batchSize delaySeconds defaultCountryCode stats activeDevice currentBatch totalBatches completedAt createdAt updatedAt')
+      .select('name notes activityNotes safetyProfile safetyCooldownSeconds safetyCooldownEvery status selectedSessions batchSize delaySeconds defaultCountryCode stats activeDevice currentBatch totalBatches completedAt createdAt updatedAt')
       .limit(limit)
       .lean();
   }
@@ -543,6 +578,53 @@ class ValidatorTaskService {
 
     await newList.save();
     return newList;
+  }
+
+  /**
+   * Add a note to a task's activityNotes log
+   */
+  async addNote(userId, taskId, { text, author = 'Admin' }) {
+    if (!text || !text.trim()) {
+      throw new Error('Note text cannot be empty.');
+    }
+
+    const task = await ValidatorTask.findOne({ _id: taskId, userId });
+    if (!task) throw new Error('Validation task not found.');
+
+    if (!Array.isArray(task.activityNotes)) {
+      task.activityNotes = [];
+    }
+
+    const newNote = {
+      text: text.trim(),
+      author: author || 'Admin',
+      createdAt: new Date(),
+    };
+
+    task.activityNotes.unshift(newNote);
+    await task.save();
+
+    return {
+      success: true,
+      activityNotes: task.activityNotes,
+      note: newNote,
+    };
+  }
+
+  /**
+   * Delete a note from a task
+   */
+  async deleteNote(userId, taskId, noteId) {
+    const task = await ValidatorTask.findOne({ _id: taskId, userId });
+    if (!task) throw new Error('Validation task not found.');
+
+    task.activityNotes = (task.activityNotes || []).filter((n) => n.noteId !== noteId);
+    await task.save();
+
+    return {
+      success: true,
+      activityNotes: task.activityNotes,
+    };
   }
 }
 

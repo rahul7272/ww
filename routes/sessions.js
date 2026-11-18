@@ -16,6 +16,7 @@ router.post("/:id/logout", authMiddleware, sessionController.logoutSession);
 router.post("/:id/pairing-code", authMiddleware, sessionController.getPairingCode);
 router.post("/:id/reconnect", authMiddleware, sessionController.reconnectSession);
 router.get("/:id/groups", authMiddleware, sessionController.getSessionGroups);
+router.get("/:id/common-members", authMiddleware, sessionController.getCommonMembers);
 router.post("/:id/groups/sync", authMiddleware, sessionController.syncSessionGroups);
 router.post("/groups/create-multi", authMiddleware, sessionController.createMultiAccountGroups);
 router.post("/:id/groups/create", authMiddleware, sessionController.createGroups);

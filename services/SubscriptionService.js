@@ -7,6 +7,7 @@ import WhatsAppSession from "../models/WhatsAppSession.js";
 import Campaign from "../models/Campaign.js";
 import NumberList from "../models/NumberList.js";
 import MediaCollection from "../models/Media.js";
+import WaChatMessage from "../models/WaChatMessage.js";
 
 const DEFAULT_FEATURES = [
   { key: "sessions", label: "WhatsApp Sessions", enabled: true },
@@ -28,13 +29,17 @@ const DEFAULT_PLANS = [
     isDemo: true,
     sortOrder: 1,
     limits: {
-      sessions: -1,
+      sessions: 1,
       campaigns: 2,
       numberLists: -1,
+      contactsPerList: 500,
       storageMb: 200,
+      mediaStorageMB: 200,
       messagesDaily: 50,
       messagesWeekly: 200,
       messagesMonthly: 500,
+      aiAgentEnabled: true,
+      flowBuilderEnabled: true,
     },
     features: DEFAULT_FEATURES,
   },
@@ -47,13 +52,17 @@ const DEFAULT_PLANS = [
     durationDays: 30,
     sortOrder: 10,
     limits: {
-      sessions: -1,
+      sessions: 2,
       campaigns: 10,
       numberLists: -1,
+      contactsPerList: 1000,
       storageMb: 300,
+      mediaStorageMB: 300,
       messagesDaily: 300,
       messagesWeekly: 1500,
       messagesMonthly: 5000,
+      aiAgentEnabled: true,
+      flowBuilderEnabled: true,
     },
     features: DEFAULT_FEATURES,
   },
@@ -66,13 +75,17 @@ const DEFAULT_PLANS = [
     durationDays: 30,
     sortOrder: 20,
     limits: {
-      sessions: -1,
+      sessions: 5,
       campaigns: 40,
       numberLists: -1,
+      contactsPerList: 5000,
       storageMb: 1024,
+      mediaStorageMB: 1024,
       messagesDaily: 2000,
       messagesWeekly: 10000,
       messagesMonthly: 40000,
+      aiAgentEnabled: true,
+      flowBuilderEnabled: true,
     },
     features: DEFAULT_FEATURES,
   },
@@ -88,10 +101,14 @@ const DEFAULT_PLANS = [
       sessions: -1,
       campaigns: -1,
       numberLists: -1,
+      contactsPerList: -1,
       storageMb: 5120,
+      mediaStorageMB: 5120,
       messagesDaily: -1,
       messagesWeekly: -1,
       messagesMonthly: -1,
+      aiAgentEnabled: true,
+      flowBuilderEnabled: true,
     },
     features: DEFAULT_FEATURES,
   },
@@ -151,8 +168,6 @@ class SubscriptionService {
         { upsert: true },
       );
     }
-
-    await SubscriptionPlan.updateMany({}, { $set: { "limits.sessions": -1, "limits.numberLists": -1 } });
 
     const demoPlan = await SubscriptionPlan.findOne({ slug: "demo" });
     const settings = await SubscriptionSettings.findOneAndUpdate(
@@ -303,7 +318,7 @@ class SubscriptionService {
   async recalculateUsage(userId) {
     const id = new mongoose.Types.ObjectId(userId);
 
-    const [sessions, campaigns, numberLists, storageAgg] = await Promise.all([
+    const [sessions, campaigns, numberLists, mediaLibraryAgg, chatMediaAgg, campaignDocs] = await Promise.all([
       WhatsAppSession.countDocuments({
         userId: id,
         $or: [
@@ -318,9 +333,45 @@ class SubscriptionService {
         { $match: { userId: id } },
         { $group: { _id: null, total: { $sum: "$totalSize" } } },
       ]),
+      WaChatMessage.aggregate([
+        {
+          $match: {
+            userId: id,
+            mediaExpired: { $ne: true },
+            $or: [
+              { mediaUrl: { $ne: null } },
+              { "rawMedia.fileLength": { $gt: 0 } },
+            ],
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            total: { $sum: { $ifNull: ["$rawMedia.fileLength", 0] } },
+          },
+        },
+      ]),
+      Campaign.find(
+        { userId: id, $or: [{ mediaFiles: { $exists: true, $ne: [] } }, { mediaUrl: { $ne: null } }] },
+        "mediaFiles mediaUrl"
+      ).lean(),
     ]);
 
-    const storageBytes = storageAgg?.[0]?.total || 0;
+    const mediaLibraryBytes = Number(mediaLibraryAgg?.[0]?.total || 0);
+    const chatMediaBytes = Number(chatMediaAgg?.[0]?.total || 0);
+
+    let campaignMediaBytes = 0;
+    if (Array.isArray(campaignDocs)) {
+      for (const camp of campaignDocs) {
+        if (Array.isArray(camp.mediaFiles)) {
+          for (const mf of camp.mediaFiles) {
+            campaignMediaBytes += Number(mf.fileSize || mf.size || 0);
+          }
+        }
+      }
+    }
+
+    const totalStorageBytes = mediaLibraryBytes + chatMediaBytes + campaignMediaBytes;
 
     const sub = await this.getUserSubscription(userId);
     if (!sub) throw new Error("Subscription not found");
@@ -328,7 +379,12 @@ class SubscriptionService {
     sub.usage.sessions = sessions;
     sub.usage.campaigns = campaigns;
     sub.usage.numberLists = numberLists;
-    sub.usage.storageBytes = storageBytes;
+    sub.usage.storageBytes = totalStorageBytes;
+    sub.usage.storageBreakdown = {
+      mediaLibraryBytes,
+      chatMediaBytes,
+      campaignMediaBytes,
+    };
     sub.usage.updatedAt = new Date();
     await sub.save();
 
@@ -357,6 +413,24 @@ class SubscriptionService {
       await sub.save().catch(() => {});
     }
 
+    const effectiveStorageMb = sub.customStorageLimitMb !== null && sub.customStorageLimitMb !== undefined
+      ? Number(sub.customStorageLimitMb)
+      : (plan?.limits?.storageMb ?? plan?.limits?.mediaStorageMB ?? -1);
+
+    const storageBytes = sub.usage.storageBytes || 0;
+    const storageLimitBytes = effectiveStorageMb > 0 ? effectiveStorageMb * 1024 * 1024 : null;
+    const storagePercentage = storageLimitBytes > 0
+      ? parseFloat(((storageBytes / storageLimitBytes) * 100).toFixed(1))
+      : 0;
+
+    const breakdown = sub.usage.storageBreakdown || {
+      mediaLibraryBytes: 0,
+      chatMediaBytes: 0,
+      campaignMediaBytes: 0,
+    };
+
+    const planLimitsObj = plan?.limits?.toObject ? plan.limits.toObject() : (plan?.limits || {});
+
     return {
       plan: {
         id: plan._id,
@@ -368,9 +442,14 @@ class SubscriptionService {
         priceMonthly: plan.priceMonthly,
         priceYearly: plan.priceYearly,
         limits: {
-          ...(plan.limits || {}),
-          sessions: -1,
+          ...planLimitsObj,
+          storageMb: effectiveStorageMb,
+          mediaStorageMB: effectiveStorageMb,
+          sessions: planLimitsObj.sessions !== undefined ? planLimitsObj.sessions : -1,
           numberLists: -1,
+          contactsPerList: planLimitsObj.contactsPerList !== undefined ? planLimitsObj.contactsPerList : -1,
+          aiAgentEnabled: planLimitsObj.aiAgentEnabled !== false,
+          flowBuilderEnabled: planLimitsObj.flowBuilderEnabled !== false,
         },
         features: plan.features,
       },
@@ -379,13 +458,24 @@ class SubscriptionService {
         startedAt: sub.startedAt,
         expiresAt: expiresAt,
         trialUsed: Boolean(sub.trialUsed || sub.status === "trial" || plan?.isDemo),
+        customStorageLimitMb: sub.customStorageLimitMb,
       },
       usage: {
         sessions: sub.usage.sessions || 0,
         campaigns: sub.usage.campaigns || 0,
         numberLists: sub.usage.numberLists || 0,
-        storageBytes: sub.usage.storageBytes || 0,
-        storageHuman: formatBytes(sub.usage.storageBytes || 0),
+        storageBytes,
+        storageHuman: formatBytes(storageBytes),
+        storagePercentage,
+        isOverStorageQuota: storageLimitBytes > 0 && storageBytes > storageLimitBytes,
+        storageBreakdown: {
+          mediaLibraryBytes: breakdown.mediaLibraryBytes || 0,
+          mediaLibraryHuman: formatBytes(breakdown.mediaLibraryBytes || 0),
+          chatMediaBytes: breakdown.chatMediaBytes || 0,
+          chatMediaHuman: formatBytes(breakdown.chatMediaBytes || 0),
+          campaignMediaBytes: breakdown.campaignMediaBytes || 0,
+          campaignMediaHuman: formatBytes(breakdown.campaignMediaBytes || 0),
+        },
         messagesDaily: dayCount,
         messagesWeekly: weekCount,
         messagesMonthly: monthCount,
@@ -453,9 +543,24 @@ class SubscriptionService {
     return roleAllowed && locationAllowed;
   }
 
-  getLimitValue(plan, key) {
-    if (key === "numberLists" || key === "sessions") return -1;
-    return Number(plan?.limits?.[key]);
+  getLimitValue(plan, key, sub = null) {
+    if (key === "storageMb" && sub?.customStorageLimitMb !== null && sub?.customStorageLimitMb !== undefined) {
+      return Number(sub.customStorageLimitMb);
+    }
+    if (key === "numberLists") return -1;
+    return Number(plan?.limits?.[key] !== undefined ? plan.limits[key] : -1);
+  }
+
+  async setUserStorageOverride(userId, customStorageLimitMb) {
+    const sub = await this.getUserSubscription(userId);
+    if (!sub) throw new Error("User subscription not found");
+
+    sub.customStorageLimitMb = customStorageLimitMb !== null && customStorageLimitMb !== undefined && Number(customStorageLimitMb) >= 0
+      ? Number(customStorageLimitMb)
+      : null;
+
+    await sub.save();
+    return this.getUsageSummary(userId);
   }
 
   async assertResourceLimit(user, resourceKey, increment = 1) {
@@ -473,7 +578,7 @@ class SubscriptionService {
       });
     }
 
-    if (resourceKey === "sessions" || resourceKey === "numberLists") {
+    if (resourceKey === "numberLists") {
       return summary;
     }
 
@@ -481,7 +586,7 @@ class SubscriptionService {
       sessions: {
         limitKey: "sessions",
         used: usage.sessions,
-        label: "sessions",
+        label: "WhatsApp sessions",
         featureKey: "sessions",
       },
       campaigns: {
@@ -505,10 +610,10 @@ class SubscriptionService {
 
     await this.assertFeatureEnabled(user, target.featureKey);
 
-    const limit = this.getLimitValue(plan, target.limitKey);
+    const limit = this.getLimitValue(plan, target.limitKey, subscription);
     if (!isUnlimited(limit) && target.used + increment > limit) {
       throw new LimitError(
-        `Your plan limit for ${target.label} has been reached.`,
+        `Your plan limit for ${target.label} (${limit}) has been reached (currently active: ${target.used}). Please upgrade your plan.`,
         {
           resource: resourceKey,
           used: target.used,
@@ -530,7 +635,7 @@ class SubscriptionService {
     const summary = await this.getUsageSummary(user._id);
     await this.assertFeatureEnabled(user, "media");
 
-    const limitMb = this.getLimitValue(summary.plan, "storageMb");
+    const limitMb = this.getLimitValue(summary.plan, "storageMb", summary.subscription);
     if (isUnlimited(limitMb)) {
       return summary;
     }
@@ -539,16 +644,19 @@ class SubscriptionService {
     const used = summary.usage.storageBytes;
 
     if (used + incomingBytes > limitBytes) {
-      throw new LimitError("Storage limit exceeded for your current plan.", {
-        resource: "storage",
-        usedBytes: used,
-        incomingBytes,
-        limitBytes,
-        usedHuman: formatBytes(used),
-        incomingHuman: formatBytes(incomingBytes),
-        limitHuman: formatBytes(limitBytes),
-        plan: summary.plan,
-      });
+      throw new LimitError(
+        `Storage limit exceeded! Your current usage is ${formatBytes(used)} of ${formatBytes(limitBytes)} allowed. Uploading this file (${formatBytes(incomingBytes)}) would exceed your quota. Please delete unneeded files or upgrade your plan.`,
+        {
+          resource: "storage",
+          usedBytes: used,
+          incomingBytes,
+          limitBytes,
+          usedHuman: formatBytes(used),
+          incomingHuman: formatBytes(incomingBytes),
+          limitHuman: formatBytes(limitBytes),
+          plan: summary.plan,
+        },
+      );
     }
 
     return summary;
@@ -695,6 +803,9 @@ class SubscriptionService {
   }
 
   toClientPlan(plan) {
+    const limitsObj = plan?.limits?.toObject ? plan.limits.toObject() : (plan?.limits || {});
+    const storageLimit = limitsObj.storageMb ?? limitsObj.mediaStorageMB ?? -1;
+
     return {
       _id: plan._id,
       name: plan.name,
@@ -710,9 +821,19 @@ class SubscriptionService {
       assignToRoles: plan.assignToRoles || [],
       assignToLocations: plan.assignToLocations || [],
       limits: {
-        ...(plan.limits || {}),
-        sessions: -1,
+        ...limitsObj,
+        sessions: limitsObj.sessions !== undefined ? limitsObj.sessions : -1,
+        campaigns: limitsObj.campaigns !== undefined ? limitsObj.campaigns : -1,
         numberLists: -1,
+        contactsPerList: limitsObj.contactsPerList !== undefined ? limitsObj.contactsPerList : -1,
+        storageMb: storageLimit,
+        mediaStorageMB: storageLimit,
+        messagesDaily: limitsObj.messagesDaily !== undefined ? limitsObj.messagesDaily : (limitsObj.messagesPerDay ?? -1),
+        messagesPerDay: limitsObj.messagesDaily !== undefined ? limitsObj.messagesDaily : (limitsObj.messagesPerDay ?? -1),
+        messagesWeekly: limitsObj.messagesWeekly !== undefined ? limitsObj.messagesWeekly : -1,
+        messagesMonthly: limitsObj.messagesMonthly !== undefined ? limitsObj.messagesMonthly : -1,
+        aiAgentEnabled: limitsObj.aiAgentEnabled !== false,
+        flowBuilderEnabled: limitsObj.flowBuilderEnabled !== false,
       },
       features: plan.features || [],
       sortOrder: plan.sortOrder,

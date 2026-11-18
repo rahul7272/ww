@@ -392,6 +392,54 @@ export const saveTaskToContactList = async (req, res) => {
   }
 };
 
+/**
+ * Add a note to a validation task
+ */
+export const addTaskNote = async (req, res) => {
+  try {
+    const { note, text, author } = req.body;
+    const noteText = text || note;
+    if (!noteText || !String(noteText).trim()) {
+      return res.status(400).json({ error: 'Note text cannot be empty' });
+    }
+
+    const authorName = author || req.user.name || req.user.email || 'Admin';
+    const result = await ValidatorTaskService.addNote(req.user._id, req.params.id, {
+      text: String(noteText).trim(),
+      author: authorName,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: 'Note added successfully',
+      activityNotes: result.activityNotes,
+      note: result.note,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'Failed to add note' });
+  }
+};
+
+/**
+ * Delete a note from a validation task
+ */
+export const deleteTaskNote = async (req, res) => {
+  try {
+    const result = await ValidatorTaskService.deleteNote(
+      req.user._id,
+      req.params.id,
+      req.params.noteId
+    );
+    return res.json({
+      success: true,
+      message: 'Note deleted successfully',
+      activityNotes: result.activityNotes,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message || 'Failed to delete note' });
+  }
+};
+
 export default {
   checkWhatsAppNumbers,
   saveValidatedList,
@@ -406,5 +454,7 @@ export default {
   stopTask,
   deleteTask,
   saveTaskToContactList,
+  addTaskNote,
+  deleteTaskNote,
 };
 

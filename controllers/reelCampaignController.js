@@ -592,17 +592,21 @@ export async function resumeCampaign(req, res) {
 
 export async function triggerUploadCheck(req, res) {
   try {
-    console.log("[🔧 DEBUG] Manually triggering upload check...");
+    const userId = req.user?._id;
+    if (!userId) {
+      return res.status(401).json({ error: "Not authenticated" });
+    }
 
     const now = new Date();
+    // Scope to user's campaigns to protect tenant isolation
+    const userCampaigns = await ReelCampaign.find({ userId }).select("_id").lean();
+    const campaignIds = userCampaigns.map((c) => c._id);
+
     const pendingReels = await Reel.find({
+      campaign: { $in: campaignIds },
       status: "pending",
       scheduledFor: { $lte: now },
     }).populate("campaign");
-
-    console.log(
-      `[🔧 DEBUG] Found ${pendingReels.length} reels ready for upload`,
-    );
 
     res.json({
       success: true,
@@ -616,7 +620,7 @@ export async function triggerUploadCheck(req, res) {
       })),
     });
   } catch (err) {
-    console.error(`[❌ DEBUG] Error:`, err?.message || err);
+    console.error(`[TRIGGER UPLOAD CHECK] Error:`, err?.message || err);
     res.status(500).json({ error: err?.message || "Check failed" });
   }
 }
@@ -627,10 +631,6 @@ export async function debugTokenStatus(req, res) {
     if (!userId) {
       return res.status(401).json({ error: "Not authenticated" });
     }
-
-    console.log(
-      `[🔧 DEBUG] Checking Instagram token status for user: ${userId}`,
-    );
 
     try {
       const creds = await getInstagramCredentials(userId);
@@ -648,7 +648,7 @@ export async function debugTokenStatus(req, res) {
         credentials: {
           method: creds.method,
           igUserId: creds.igUserId,
-          tokenPrefix: creds.accessToken?.substring(0, 20) + "...",
+          tokenConfigured: Boolean(creds.accessToken),
         },
         session: session
           ? {
@@ -684,7 +684,7 @@ export async function debugTokenStatus(req, res) {
       });
     }
   } catch (err) {
-    console.error(`[❌ DEBUG TOKEN] Error:`, err?.message || err);
+    console.error(`[DEBUG TOKEN] Error:`, err?.message || err);
     res.status(500).json({ error: err?.message || "Token check failed" });
   }
 }

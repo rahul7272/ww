@@ -15,6 +15,40 @@ const replyDelay = (type) => {
   return 1000 + Math.random() * 2000; // natural (default)
 };
 
+// ── Ingress Bulkhead: Protects Event Loop & Sockets during High Traffic or LLM Stalls ──
+class AsyncBulkhead {
+  constructor(maxConcurrent = 10, maxQueue = 50) {
+    this.maxConcurrent = maxConcurrent;
+    this.maxQueue = maxQueue;
+    this.active = 0;
+    this.queue = [];
+  }
+
+  async run(taskFn) {
+    if (this.active >= this.maxConcurrent) {
+      if (this.queue.length >= this.maxQueue) {
+        const err = new Error("AI Agent capacity saturated (bulkhead queue full)");
+        err.code = "BULKHEAD_FULL";
+        throw err;
+      }
+      await new Promise((resolve) => this.queue.push(resolve));
+    }
+
+    this.active++;
+    try {
+      return await taskFn();
+    } finally {
+      this.active--;
+      if (this.queue.length > 0) {
+        const next = this.queue.shift();
+        next();
+      }
+    }
+  }
+}
+
+const aiBulkhead = new AsyncBulkhead(10, 50);
+
 async function callOpenRouter(message, summaryText, settings) {
   const model = settings.model || "openai/gpt-4o-mini";
 
@@ -22,12 +56,14 @@ async function callOpenRouter(message, summaryText, settings) {
     ? `You are a customer support AI assistant representing the business described below. You speak on behalf of this business — when someone asks "your name", "who are you", or similar, answer using the name and details from the business info below.\n\nBusiness info:\n${summaryText}\n\nRules:\n- Answer questions using only the business info above.\n- Speak as a representative of this business.\n- If a question cannot be answered from the info above, say: "Please contact support."\n- Be concise and friendly.`
     : "You are a helpful AI customer support agent. Be concise and friendly.";
 
+  // Enforce strict 15-second execution deadline to prevent hanging event loop sockets
   const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${settings.apiKey}`,
     },
+    signal: AbortSignal.timeout(15000), // 15s deadline
     body: JSON.stringify({
       model,
       temperature: 0.5,
@@ -49,7 +85,7 @@ async function callOpenRouter(message, summaryText, settings) {
 // Called for every incoming WhatsApp message on a session
 export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) {
   if (!text?.trim()) {
-    return;
+    return false;
   }
 
   const isGroup = senderJid && (senderJid.endsWith('@g.us') || senderJid.includes('@g.us'));
@@ -59,7 +95,7 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
   const lastReply = replyCooldown.get(cooldownKey) || 0;
   if (Date.now() - lastReply < 3000) {
     console.log(`[AI Agent] ${sessionId} — cooldown active for ${senderJid}, skipping`);
-    return;
+    return false;
   }
 
   try {
@@ -69,7 +105,7 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
     const agent = await AiAgent.findOne({ sessionId, isActive: true, autoReplyEnabled: true }).lean();
     if (!agent) {
       console.log(`[AI Agent] ✗ No active agent found for sessionId="${sessionId}"`);
-      return;
+      return false;
     }
     console.log(`[AI Agent] ✔ Agent found: ${agent._id} (${agent.agentName})`);
 
@@ -85,7 +121,7 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
         const matched = keywords.some((k) => lowerText.includes(k));
         if (!matched) {
           console.log(`[AI Agent] ✗ Keyword condition not met for "${text.slice(0, 40)}" — keywords: ${keywords.join(",")}`);
-          return;
+          return false;
         }
       }
     }
@@ -95,7 +131,7 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
     const escalateWord = (agent.config?.reply?.escalate || "").trim().toLowerCase();
     if (escalateWord && text.toLowerCase().includes(escalateWord)) {
       console.log(`[AI Agent] ✗ Escalation keyword "${escalateWord}" matched — handing off to human`);
-      return;
+      return false;
     }
 
     // ── Step 4: Get OpenRouter settings ───────────────────────────────────
@@ -108,7 +144,7 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
 
     if (!settings.apiKey) {
       console.log(`[AI Agent] ✗ No OpenRouter API key configured`);
-      return;
+      return false;
     }
     console.log(`[AI Agent] ✔ OpenRouter settings OK, model=${settings.model}`);
 
@@ -133,10 +169,16 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
       await delay(waitMs);
     }
 
-    // ── Step 7: Call OpenRouter ────────────────────────────────────────────
-    console.log(`[AI Agent] ⚡ Calling OpenRouter with message: "${text.slice(0, 60)}"`);
-    const reply = await callOpenRouter(text, summaryText, settings);
-    console.log(`[AI Agent] ✔ OpenRouter reply: "${reply.slice(0, 80)}"`);
+    // ── Step 7: Call OpenRouter with Bulkhead & Graceful Fallback ──────────
+    console.log(`[AI Agent] ⚡ Calling OpenRouter with message: "${text.slice(0, 60)}" (Bulkhead active: ${aiBulkhead.active}/${aiBulkhead.maxConcurrent})`);
+    let reply = "";
+    try {
+      reply = await aiBulkhead.run(() => callOpenRouter(text, summaryText, settings));
+      console.log(`[AI Agent] ✔ OpenRouter reply: "${reply.slice(0, 80)}"`);
+    } catch (aiErr) {
+      console.warn(`[AI Agent] ⚠️ Upstream LLM call failed or timed out: ${aiErr.message}. Employing graceful degradation fallback.`);
+      reply = "Our automated assistant is temporarily experiencing high inquiry volume. A team member will assist you shortly.";
+    }
 
     // ── Step 8: Send reply via WhatsApp ────────────────────────────────────
     replyCooldown.set(cooldownKey, Date.now());
@@ -158,7 +200,9 @@ export async function handleIncomingMessage(sessionId, senderJid, text, sendFn) 
       replyText: reply,
     });
 
+    return true; // Successfully answered by chatbot
   } catch (err) {
     console.error(`[AI Agent] ✗ Error on session=${sessionId}:`, err.message);
+    return false;
   }
 }

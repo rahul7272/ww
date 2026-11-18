@@ -72,11 +72,26 @@ class DripService {
   constructor() {
     this.isProcessing = false;
     this.io = null;
+
+    // Telemetry & backpressure counters (Phase 3 - Task 3.2)
+    this.totalProcessedSteps = 0;
+    this.totalFailedSteps = 0;
+    this.consecutiveFailures = 0;
+
     this.scheduler = new NextDueScheduler({
       name: "DRIP SERVICE",
       getNextRunAt: () => this.getNextRunAt(),
       processDue: () => this.processDueSteps(),
     });
+  }
+
+  getTelemetry() {
+    return {
+      isProcessing: this.isProcessing,
+      totalProcessedSteps: this.totalProcessedSteps,
+      totalFailedSteps: this.totalFailedSteps,
+      consecutiveFailures: this.consecutiveFailures,
+    };
   }
 
   setSocketIO(io) {
@@ -291,6 +306,8 @@ class DripService {
           );
 
           if (sendResult?.success) {
+            this.totalProcessedSteps++;
+            this.consecutiveFailures = 0;
             recipient.currentStep = step.stepIndex;
             recipient.lastSentAt = new Date();
 
@@ -335,6 +352,8 @@ class DripService {
             throw new Error(sendResult?.error || "Send returned false");
           }
         } catch (sendErr) {
+          this.totalFailedSteps++;
+          this.consecutiveFailures++;
           console.error(
             `[DRIP SEND ERROR] Failed step ${step.stepIndex} for ${recipient.chatJid}:`,
             sendErr.message
@@ -348,7 +367,27 @@ class DripService {
             error: sendErr.message,
           });
 
-          recipient.nextExecutionTime = new Date(Date.now() + 10 * 60 * 1000);
+          // Cap retries per step to prevent infinite retry loop & document bloat
+          const failedCountForStep = recipient.logs.filter(
+            (l) => l.stepIndex === step.stepIndex && l.status === "failed"
+          ).length;
+
+          const MAX_DRIP_STEP_RETRIES = 3;
+          if (failedCountForStep >= MAX_DRIP_STEP_RETRIES) {
+            console.warn(
+              `[DRIP] Recipient ${recipient.chatJid} reached max retries (${MAX_DRIP_STEP_RETRIES}) on step ${step.stepIndex}. Marking recipient as failed.`
+            );
+            recipient.status = "failed";
+            recipient.nextExecutionTime = null;
+            if (campaign?._id) {
+              await DripCampaign.findByIdAndUpdate(campaign._id, {
+                $inc: { "stats.activeCount": -1, "stats.failedCount": 1 },
+              }).catch(() => {});
+            }
+          } else {
+            recipient.nextExecutionTime = new Date(Date.now() + 10 * 60 * 1000);
+          }
+
           await recipient.save();
         }
       }

@@ -34,10 +34,14 @@ const subscriptionPlanSchema = new mongoose.Schema(
       sessions: { type: Number, default: -1 },
       campaigns: { type: Number, default: -1 },
       numberLists: { type: Number, default: -1 },
+      contactsPerList: { type: Number, default: -1 },
       storageMb: { type: Number, default: -1 },
+      mediaStorageMB: { type: Number, default: -1 },
       messagesDaily: { type: Number, default: -1 },
       messagesWeekly: { type: Number, default: -1 },
       messagesMonthly: { type: Number, default: -1 },
+      aiAgentEnabled: { type: Boolean, default: true },
+      flowBuilderEnabled: { type: Boolean, default: true },
     },
     features: [featureSchema],
   },
@@ -45,5 +49,17 @@ const subscriptionPlanSchema = new mongoose.Schema(
 );
 
 subscriptionPlanSchema.index({ isActive: 1, sortOrder: 1 });
+
+// Ensure storageMb and mediaStorageMB remain synchronized
+subscriptionPlanSchema.pre("save", function (next) {
+  if (this.limits) {
+    if (this.limits.storageMb !== undefined && (this.limits.mediaStorageMB === undefined || this.limits.mediaStorageMB === -1)) {
+      this.limits.mediaStorageMB = this.limits.storageMb;
+    } else if (this.limits.mediaStorageMB !== undefined && (this.limits.storageMb === undefined || this.limits.storageMb === -1)) {
+      this.limits.storageMb = this.limits.mediaStorageMB;
+    }
+  }
+  next();
+});
 
 export default mongoose.model("SubscriptionPlan", subscriptionPlanSchema);

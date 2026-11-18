@@ -8,6 +8,9 @@ import { handleIncomingMessage } from "./AiAgentService.js";
 import { recordIncomingMetaAiMessage, isMetaAiJid, META_AI_NORMALIZED_JID } from "./MetaAiService.js";
 import { isSessionWriteAllowed } from "../utils/sessionLifecycle.js";
 import { processIncomingMediaMessage } from "../utils/mediaSettingsHelper.js";
+import dripService from "./DripService.js";
+import { evaluateInboundMessage } from "./whatsappAutomationService.js";
+import { executeFlowOnMessage } from "../controllers/flowExecutionController.js";
 
 /**
  * Normalizes JID to standard WhatsApp format without device identifiers
@@ -53,14 +56,22 @@ function toNumericValue(val) {
 }
 
 /**
- * Converts a Baileys timestamp (seconds, ms, or protobuf Long) into a valid Date or null.
+ * Converts a Baileys timestamp (seconds, ms, Date instance, or protobuf Long) into a valid Date or null.
  */
 function toUnixDate(val) {
+  if (!val) return null;
+  if (val instanceof Date) {
+    return Number.isNaN(val.getTime()) ? null : val;
+  }
   const raw = toNumericValue(val);
   if (!raw || raw <= 0) return null;
   const ms = raw > 1e12 ? raw : raw * 1000;
-  const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? null : d;
+  try {
+    const d = new Date(ms);
+    return d && typeof d.getTime === "function" && !Number.isNaN(d.getTime()) ? d : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -68,8 +79,11 @@ function toUnixDate(val) {
  */
 function parsePinnedState(pinnedVal) {
   if (pinnedVal === true) return { isPinned: true, pinnedAt: new Date() };
-  if (pinnedVal === false || pinnedVal === null || pinnedVal === 0) {
+  if (pinnedVal === false || pinnedVal === null || pinnedVal === undefined || pinnedVal === 0) {
     return { isPinned: false, pinnedAt: null };
+  }
+  if (pinnedVal instanceof Date) {
+    return { isPinned: true, pinnedAt: Number.isNaN(pinnedVal.getTime()) ? new Date() : pinnedVal };
   }
   const d = toUnixDate(pinnedVal);
   if (d) return { isPinned: true, pinnedAt: d };
@@ -80,7 +94,7 @@ function parsePinnedState(pinnedVal) {
 /**
  * Resolves @lid JIDs to their real @s.whatsapp.net PN JID when available via Baileys alt fields, lidMapping, or auth state
  */
-async function resolveLidToPnJid(rawJid, altJid, sock, sessionId = null) {
+async function resolveLidToPnJid(rawJid, altJid, sock, sessionId = null, lidReverseMap = null) {
   if (!rawJid || typeof rawJid !== "string") return "";
   let normalized = normalizeJid(rawJid);
   if (!normalized.endsWith("@lid")) return normalized;
@@ -92,11 +106,14 @@ async function resolveLidToPnJid(rawJid, altJid, sock, sessionId = null) {
     try {
       const pnJid = await sock.signalRepository.lidMapping.getPNForLID(rawJid);
       if (pnJid) return normalizeJid(pnJid);
-    } catch (_) {}
+    } catch (_) { }
+  }
+  const lidUser = normalized.replace(/@.*/, "").replace(/:\d+$/, "");
+  if (lidReverseMap && lidUser && lidReverseMap.has(lidUser)) {
+    return lidReverseMap.get(lidUser);
   }
   if (sessionId) {
     try {
-      const lidUser = normalized.replace(/@.*/, "").replace(/:\d+$/, "");
       if (lidUser) {
         const revDoc = await WhatsAppAuthState.findOne({
           sessionId,
@@ -112,7 +129,7 @@ async function resolveLidToPnJid(rawJid, altJid, sock, sessionId = null) {
           }
         }
       }
-    } catch (_) {}
+    } catch (_) { }
   }
   return normalized;
 }
@@ -143,11 +160,21 @@ function unwrapMessage(msg) {
 
   const msgContent = rawMsg?.viewOnceMessage?.message || rawMsg;
 
+  let nativeFlowSelected = "";
+  const nativeFlowJson = msgContent?.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+  if (nativeFlowJson) {
+    try {
+      const parsed = JSON.parse(nativeFlowJson);
+      nativeFlowSelected = parsed.id || parsed.selected_id || parsed.display_text || "";
+    } catch (_) { }
+  }
+
   const text =
     msgContent?.conversation ||
     msgContent?.extendedTextMessage?.text ||
-    msgContent?.interactiveMessage?.body?.text ||
     msgContent?.interactiveResponseMessage?.body?.text ||
+    nativeFlowSelected ||
+    msgContent?.interactiveMessage?.body?.text ||
     msgContent?.interactiveMessage?.header?.title ||
     msgContent?.buttonsMessage?.contentText ||
     msgContent?.templateMessage?.hydratedTemplate?.hydratedContentText ||
@@ -167,12 +194,12 @@ function unwrapMessage(msg) {
   const mediaType = msgContent?.imageMessage
     ? "image"
     : msgContent?.videoMessage
-    ? "video"
-    : msgContent?.documentMessage
-    ? "document"
-    : msgContent?.audioMessage
-    ? "audio"
-    : null;
+      ? "video"
+      : msgContent?.documentMessage
+        ? "document"
+        : msgContent?.audioMessage
+          ? "audio"
+          : null;
 
   const contextInfo =
     msgContent?.extendedTextMessage?.contextInfo ||
@@ -324,7 +351,7 @@ class ChatSyncService {
           });
         }
         if (contactBulk.length > 0 && isSessionWriteAllowed(sessionId, sock)) {
-          await WaContact.bulkWrite(contactBulk, { ordered: false }).catch(() => {});
+          await WaContact.bulkWrite(contactBulk, { ordered: false }).catch(() => { });
         }
       }
 
@@ -368,7 +395,6 @@ class ChatSyncService {
                   userId,
                   sessionId,
                   chatJid: normJid,
-                  ...(isGroup ? {} : { phoneNumber: phone }),
                   name: chatName,
                   contactName: chatName,
                   lastMessage: "",
@@ -381,7 +407,7 @@ class ChatSyncService {
           });
         }
         if (chatBulk.length > 0 && isSessionWriteAllowed(sessionId, sock)) {
-          await WaChat.bulkWrite(chatBulk, { ordered: false }).catch(() => {});
+          await WaChat.bulkWrite(chatBulk, { ordered: false }).catch(() => { });
         }
       }
 
@@ -389,6 +415,41 @@ class ChatSyncService {
 
       // 3. Process messages into WaChatMessage and backfill latest message preview onto WaChat
       if (Array.isArray(messages) && messages.length > 0) {
+        // Pre-resolve all unique @lid JIDs in 1 batch MongoDB query to avoid thousands of serial DB calls
+        const rawLidUsers = new Set();
+        for (const msg of messages) {
+          const rJid = msg.key?.remoteJid;
+          const pJid = msg.key?.participant;
+          if (rJid && typeof rJid === "string" && rJid.endsWith("@lid")) {
+            rawLidUsers.add(rJid.replace(/@.*/, "").replace(/:\d+$/, ""));
+          }
+          if (pJid && typeof pJid === "string" && pJid.endsWith("@lid")) {
+            rawLidUsers.add(pJid.replace(/@.*/, "").replace(/:\d+$/, ""));
+          }
+        }
+
+        const lidReverseMap = new Map();
+        if (rawLidUsers.size > 0 && sessionId) {
+          try {
+            const revDocs = await WhatsAppAuthState.find({
+              sessionId,
+              dataType: "lid-mapping",
+              dataId: { $in: Array.from(rawLidUsers).map((u) => `${u}_reverse`) },
+            })
+              .select("dataId dataJson")
+              .lean();
+            for (const doc of revDocs || []) {
+              try {
+                const u = doc.dataId.replace(/_reverse$/, "");
+                const parsedPn = String(JSON.parse(doc.dataJson) || "").replace(/\D/g, "");
+                if (parsedPn && parsedPn !== u) {
+                  lidReverseMap.set(u, `${parsedPn}@s.whatsapp.net`);
+                }
+              } catch (_) { }
+            }
+          } catch (_) { }
+        }
+
         const msgBulk = [];
         const chatLatestMap = new Map();
         for (const msg of messages) {
@@ -397,9 +458,9 @@ class ChatSyncService {
           const isFromMe = !!msg.key.fromMe;
           const rawSender = msg.key.remoteJid;
           if (!rawSender) continue;
-          const normJid = await resolveLidToPnJid(rawSender, msg.key.remoteJidAlt, sock, sessionId);
+          const normJid = await resolveLidToPnJid(rawSender, msg.key.remoteJidAlt, sock, sessionId, lidReverseMap);
           const participantJid = msg.key.participant
-            ? await resolveLidToPnJid(msg.key.participant, msg.key.participantAlt, sock, sessionId)
+            ? await resolveLidToPnJid(msg.key.participant, msg.key.participantAlt, sock, sessionId, lidReverseMap)
             : (isFromMe ? null : normJid);
 
           const { text, mediaType, quotedMessage } = unwrapMessage(msg);
@@ -433,7 +494,9 @@ class ChatSyncService {
             const rawPush = !isFromMe && !normJid.endsWith("@g.us") ? (msg.pushName || "").trim() : "";
             const safePush = rawPush && (!ownProfileName || rawPush.toLowerCase() !== ownProfileName) ? rawPush : "";
             const prev = chatLatestMap.get(normJid);
-            if (!prev || timestamp.getTime() >= prev.timestamp.getTime()) {
+            const prevTime = prev?.lastMessageTime ? new Date(prev.lastMessageTime).getTime() : 0;
+            const curTime = timestamp ? new Date(timestamp).getTime() : Date.now();
+            if (!prev || curTime >= prevTime) {
               chatLatestMap.set(normJid, {
                 lastMessage: snippet,
                 lastMessageTime: timestamp,
@@ -444,7 +507,7 @@ class ChatSyncService {
         }
 
         if (msgBulk.length > 0 && isSessionWriteAllowed(sessionId, sock)) {
-          await WaChatMessage.bulkWrite(msgBulk, { ordered: false }).catch(() => {});
+          await WaChatMessage.bulkWrite(msgBulk, { ordered: false }).catch(() => { });
         }
 
         if (chatLatestMap.size > 0 && isSessionWriteAllowed(sessionId, sock)) {
@@ -476,7 +539,7 @@ class ChatSyncService {
             });
           }
           if (isSessionWriteAllowed(sessionId, sock)) {
-            await WaChat.bulkWrite(previewOps, { ordered: false }).catch(() => {});
+            await WaChat.bulkWrite(previewOps, { ordered: false }).catch(() => { });
           }
         }
       }
@@ -521,7 +584,7 @@ class ChatSyncService {
         io.to(`user:${userId.toString()}`).emit("chats:synced", syncPayload);
       }
     } catch (err) {
-      console.error(`[CHAT SYNC] Error in handleHistorySync:`, err.message);
+      console.error(`[CHAT SYNC] Error in handleHistorySync:`, err.stack || err.message);
     }
   }
 
@@ -558,8 +621,8 @@ class ChatSyncService {
       const resolvedPhoneNumber = isMetaAi
         ? "13135550002"
         : isGroup
-        ? ""
-        : extractPhoneNumber(resolvedSenderJid);
+          ? ""
+          : extractPhoneNumber(resolvedSenderJid);
 
       const { text, mediaType, quotedMessage, msgContent, isProtocolEdit, targetEditMessageId, buttons, header, footer } = unwrapMessage(msg);
 
@@ -693,8 +756,8 @@ class ChatSyncService {
       const chatDisplayName = isMetaAi
         ? "Meta AI"
         : isGroup
-        ? (groupSubject || "WhatsApp Group")
-        : (contactName || (resolvedPhoneNumber ? `+${resolvedPhoneNumber}` : "WhatsApp Contact"));
+          ? (groupSubject || "WhatsApp Group")
+          : (contactName || (resolvedPhoneNumber ? `+${resolvedPhoneNumber}` : "WhatsApp Contact"));
 
       const existingNameClean = (existingChat?.name || "").trim();
       const shouldRepairExistingName =
@@ -764,8 +827,8 @@ class ChatSyncService {
         const resolvedDisplayName = isMetaAi
           ? "Meta AI"
           : isGroup
-          ? (chatDoc?.groupSubject || chatDoc?.name || groupSubject || "WhatsApp Group")
-          : (
+            ? (chatDoc?.groupSubject || chatDoc?.name || groupSubject || "WhatsApp Group")
+            : (
               (chatDoc?.name && !/^\+\d+$/.test(chatDoc.name.trim()) ? chatDoc.name.trim() : "") ||
               chatDoc?.contactName ||
               contactName ||
@@ -827,14 +890,25 @@ class ChatSyncService {
               { $set: { status: "read" } }
             );
             if (io) {
-              for (const pId of prevIds) {
-                const statusPayload = { sessionId, messageId: pId, status: "read" };
-                io.to(sessionId).emit("chat:message_status", statusPayload);
-                io.to(`user:${userId.toString()}`).emit("chat:message_status", statusPayload);
+              const batchPayload = {
+                sessionId,
+                chatJid: resolvedSenderJid,
+                messageIds: prevIds,
+                status: "read",
+              };
+              io.to(sessionId).emit("chat:message_status_batch", batchPayload);
+              io.to(`user:${userId.toString()}`).emit("chat:message_status_batch", batchPayload);
+
+              // Also emit legacy individual events for backward compatibility when count is small
+              if (prevIds.length <= 5) {
+                for (const pId of prevIds) {
+                  const statusPayload = { sessionId, messageId: pId, status: "read" };
+                  io.to(sessionId).emit("chat:message_status", statusPayload);
+                }
               }
             }
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       // 5. CRM contact interaction sync
@@ -851,25 +925,71 @@ class ChatSyncService {
               },
               $inc: { totalConversations: 1 },
             }
-          ).exec().catch(() => {});
+          ).exec().catch(() => { });
         }
       }
 
-      // 6. Drip campaigns & AI Agent responses for incoming messages
+      // 6. Drip campaigns, AI Agent, and Automation Rules (WhatsApp Only)
       if (!isFromMe) {
         const cleanText = text || (mediaType ? `[${mediaType}]` : "");
         dripService
           .handleIncomingReply(userId, sessionId, resolvedSenderJid, cleanText, resolvedPhoneNumber)
           .catch((err) => console.error("[CHAT SYNC] Drip trigger error:", err.message));
 
-        handleIncomingMessage(sessionId, rawSenderJid, text, async (jid, content) => {
-          if (sock) {
-            await sock.sendPresenceUpdate("composing", jid);
-            await new Promise((resolve) => setTimeout(resolve, 1800));
-            await sock.sendMessage(jid, { text: content });
-            await sock.sendPresenceUpdate("paused", jid);
+        // Evaluate AI Agent first to check precedence ("Skipped when a chatbot already answered")
+        (async () => {
+          let chatbotAnswered = false;
+          try {
+            chatbotAnswered = await handleIncomingMessage(sessionId, rawSenderJid, text, async (jid, content) => {
+              if (sock) {
+                await sock.sendPresenceUpdate("composing", jid).catch(() => {});
+                await new Promise((resolve) => setTimeout(resolve, 1800));
+                await sock.sendMessage(jid, { text: content });
+                await sock.sendPresenceUpdate("paused", jid).catch(() => {});
+              }
+            });
+          } catch (err) {
+            console.error("[CHAT SYNC] AI Agent error:", err);
           }
-        }).catch((err) => console.error("[CHAT SYNC] AI Agent error:", err));
+
+          // 7. Automation Rules (Welcome message, Away message, Business hours)
+          // Strictly WhatsApp only, skipped when group or when chatbot already answered
+          if (userId && !isGroup) {
+            evaluateInboundMessage({
+              userId,
+              sessionId,
+              senderJid: resolvedSenderJid || rawSenderJid,
+              pushName: pushName || contactName || "",
+              phoneNumber: resolvedPhoneNumber,
+              chatbotAnswered: Boolean(chatbotAnswered),
+            })
+              .then(async (result) => {
+                if (!result) return;
+
+                if (result.action === "send_welcome" || result.action === "send_away") {
+                  const targetJid = resolvedSenderJid || rawSenderJid;
+                  if (sock && result.text && targetJid) {
+                    await sock.sendPresenceUpdate("composing", targetJid).catch(() => {});
+                    await new Promise((r) => setTimeout(r, 1200));
+                    await sock.sendMessage(targetJid, { text: result.text });
+                    await sock.sendPresenceUpdate("paused", targetJid).catch(() => {});
+                    console.log(`[AUTOMATION] ${result.action} successfully sent to ${targetJid}`);
+                  }
+
+                  // If welcome message configured "Then continue in flow"
+                  if (result.action === "send_welcome" && result.thenContinueType === "flow") {
+                    executeFlowOnMessage(
+                      sessionId,
+                      resolvedPhoneNumber || resolvedSenderJid || rawSenderJid,
+                      cleanText || "Welcome",
+                      userId
+                    ).catch((err) => console.error("[AUTOMATION] Flow trigger error:", err.message));
+                  }
+                }
+              })
+              .catch((err) => console.error("[AUTOMATION] Inbound message evaluation error:", err.message));
+          }
+        })().catch((err) => console.error("[CHAT SYNC] Message pipeline error:", err.message));
       }
     }
   }
@@ -1146,11 +1266,11 @@ class ChatSyncService {
         await WaChat.updateMany(
           { userId, sessionId, chatJid: lidJid },
           { $set: { phoneNumber: pnDigits } }
-        ).catch(() => {});
+        ).catch(() => { });
         await WaContact.updateMany(
           { userId, sessionId, jid: lidJid },
           { $set: { phoneNumber: pnDigits } }
-        ).catch(() => {});
+        ).catch(() => { });
       }
     } catch (err) {
       console.warn("[CHAT SYNC] lid-mapping.update error:", err.message);
@@ -1167,12 +1287,10 @@ class ChatSyncService {
     const andConditions = [{ userId }, { sessionId }];
 
     // Exclude empty @lid ghost stubs (zero messages and zero unread) from flooding the inbox
-    const msgChatJids = await WaChatMessage.distinct("chatJid", { userId, sessionId });
     if (!search && tab !== "groups") {
       andConditions.push({
         $or: [
           { chatJid: { $not: /@lid$/ } },
-          ...(msgChatJids.length > 0 ? [{ chatJid: { $in: msgChatJids } }] : []),
           { lastMessage: { $nin: ["", null] } },
           { unreadCount: { $gt: 0 } },
         ],
@@ -1307,7 +1425,7 @@ class ChatSyncService {
           if (parsedPn && parsedPn !== u) {
             lidToPnMap.set(u, parsedPn);
           }
-        } catch (_) {}
+        } catch (_) { }
       }
     }
 
@@ -1319,23 +1437,23 @@ class ChatSyncService {
     const [contactDocs, latestMsgAgg, credsDoc] = await Promise.all([
       contactLookupJids.size > 0
         ? WaContact.find({ userId, sessionId, jid: { $in: Array.from(contactLookupJids) } })
-            .select("jid name pushName verifiedName phoneNumber")
-            .lean()
-            .catch(() => [])
+          .select("jid name pushName verifiedName phoneNumber")
+          .lean()
+          .catch(() => [])
         : [],
       docJids.length > 0
         ? WaChatMessage.aggregate([
-            { $match: { userId, sessionId, chatJid: { $in: docJids } } },
-            { $sort: { timestamp: -1 } },
-            {
-              $group: {
-                _id: "$chatJid",
-                text: { $first: "$text" },
-                mediaType: { $first: "$mediaType" },
-                timestamp: { $first: "$timestamp" },
-              },
+          { $match: { userId, sessionId, chatJid: { $in: docJids } } },
+          { $sort: { timestamp: -1 } },
+          {
+            $group: {
+              _id: "$chatJid",
+              text: { $first: "$text" },
+              mediaType: { $first: "$mediaType" },
+              timestamp: { $first: "$timestamp" },
             },
-          ]).catch(() => [])
+          },
+        ]).catch(() => [])
         : [],
       WhatsAppAuthState.findOne({ sessionId, dataType: "creds", dataId: "creds" })
         .select("dataJson")
@@ -1350,7 +1468,7 @@ class ChatSyncService {
         const parsedCreds = JSON.parse(credsDoc.dataJson);
         ownProfileName = (parsedCreds?.me?.name || "").trim().toLowerCase();
         ownPhone = parsedCreds?.me?.id ? extractPhoneNumber(parsedCreds.me.id) : "";
-      } catch (_) {}
+      } catch (_) { }
     }
 
     const contactByJid = new Map();
@@ -1382,13 +1500,13 @@ class ChatSyncService {
       let cleanPhone = isGroup
         ? ""
         : (
-            mappedPn ||
-            validStoredPhone ||
-            contactStoredPhone ||
-            (!isLidJid ? c.chatJid.replace(/@.*/, "") : "")
-          )
-            .replace(/:\d+$/, "")
-            .replace(/\D/g, "");
+          mappedPn ||
+          validStoredPhone ||
+          contactStoredPhone ||
+          (!isLidJid ? c.chatJid.replace(/@.*/, "") : "")
+        )
+          .replace(/:\d+$/, "")
+          .replace(/\D/g, "");
 
       const isSelfChat = !!(ownPhone && cleanPhone && ownPhone === cleanPhone);
 
@@ -1490,21 +1608,21 @@ class ChatSyncService {
                 $set: {
                   ...(nameNeedsRepair
                     ? {
-                        name: displayName,
-                        ...(bookName || chatSavedContactName ? { contactName: bookName || chatSavedContactName } : {}),
-                      }
+                      name: displayName,
+                      ...(bookName || chatSavedContactName ? { contactName: bookName || chatSavedContactName } : {}),
+                    }
                     : {}),
                   ...(crmNeedsRepair
                     ? {
-                        clientId: expectedClientId,
-                        clientName: expectedClientName,
-                        companyId: expectedCompanyId,
-                        companyName: expectedCompanyName,
-                        crmContactId: expectedQueryId,
-                        queryId: expectedQueryCode,
-                        queryTitle: expectedQueryTitle,
-                        leadStatus: expectedLeadStatus,
-                      }
+                      clientId: expectedClientId,
+                      clientName: expectedClientName,
+                      companyId: expectedCompanyId,
+                      companyName: expectedCompanyName,
+                      crmContactId: expectedQueryId,
+                      queryId: expectedQueryCode,
+                      queryTitle: expectedQueryTitle,
+                      leadStatus: expectedLeadStatus,
+                    }
                     : {}),
                 },
               },
@@ -1558,7 +1676,7 @@ class ChatSyncService {
     });
 
     if (repairOps.length > 0) {
-      WaChat.bulkWrite(repairOps, { ordered: false }).catch(() => {});
+      WaChat.bulkWrite(repairOps, { ordered: false }).catch(() => { });
     }
 
     formattedChats.sort((a, b) => {
@@ -1618,7 +1736,7 @@ class ChatSyncService {
 
           // Ensure latest WaChat mirrors stay consistent if WhatsAppGroup had any prior records
           if (Array.isArray(gResult?.groups) && gResult.groups.length > 0) {
-            await groupSyncService.syncGroupsToWaChat(session, gResult.groups, new Date()).catch(() => {});
+            await groupSyncService.syncGroupsToWaChat(session, gResult.groups, new Date()).catch(() => { });
           }
         } catch (gErr) {
           console.warn("[CHAT SYNC] Group sync warning during syncSessionChats:", gErr.message);
@@ -1641,7 +1759,7 @@ class ChatSyncService {
           if (existingGroups.length > 0) {
             await groupSyncService.syncGroupsToWaChat(session, existingGroups, new Date());
           }
-        } catch (_) {}
+        } catch (_) { }
 
         const [count, groupsCount] = await Promise.all([
           WaChat.countDocuments({ sessionId, userId: session.userId }),

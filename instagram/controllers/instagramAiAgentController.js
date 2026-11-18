@@ -97,14 +97,30 @@ function extractJson(text) {
   if (!raw) throw new Error("Empty OpenRouter response");
 
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced?.[1] || raw;
+  const candidate = (fenced?.[1] || raw).trim();
   const start = candidate.indexOf("{");
   const end = candidate.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) {
     throw new Error("Response was not valid JSON");
   }
 
-  return JSON.parse(candidate.slice(start, end + 1));
+  const jsonStr = candidate.slice(start, end + 1);
+
+  // 1. Direct parse attempt
+  try {
+    return JSON.parse(jsonStr);
+  } catch (initialErr) {
+    // 2. Resilient sanitization pass: strip comments and trailing commas before closing braces/brackets
+    try {
+      const sanitized = jsonStr
+        .replace(/\/\/.*$/gm, "")
+        .replace(/,\s*([}\]])/g, "$1");
+      return JSON.parse(sanitized);
+    } catch (sanitizeErr) {
+      console.warn("[AI AGENT] JSON parse failed after sanitization:", sanitizeErr.message);
+      throw new Error(`Response was not valid JSON: ${initialErr.message}`);
+    }
+  }
 }
 
 async function getOpenRouterSettings() {

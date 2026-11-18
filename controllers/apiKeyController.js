@@ -110,36 +110,18 @@ export const deleteApiKey = async (req, res) => {
 // Internal helper used by auth middleware
 export const findUserByApiKey = async (rawKey) => {
   try {
+    if (!rawKey) return null;
     const keyHash = sha256(rawKey);
 
-    console.log("🗝️  [API-KEY] rawKey prefix :", rawKey.slice(0, 20) + "…");
-    console.log("🗝️  [API-KEY] sha256 hash   :", keyHash.slice(0, 24) + "…");
-
-    // Check total docs in collection first
-    const total = await ApiKey.countDocuments();
-    console.log("🗝️  [API-KEY] Total ApiKey docs in DB :", total);
-
-    // Look for ANY active key for debugging
-    const allActive = await ApiKey.find({ status: "active" }).select("keyHash keyPrefix").lean();
-    console.log("🗝️  [API-KEY] Active keys in DB :", allActive.length);
-    allActive.forEach((k, i) => {
-      console.log(`🗝️  [API-KEY]   [${i}] prefix=${k.keyPrefix}  hash=${k.keyHash.slice(0, 24)}…`);
-    });
-
     const apiKey = await ApiKey.findOne({ keyHash, status: "active" }).populate("userId");
-    console.log("🗝️  [API-KEY] findOne result :", apiKey ? `found — id=${apiKey._id}` : "NOT FOUND");
-
     if (!apiKey) return null;
-
-    // Check populated user
-    console.log("🗝️  [API-KEY] populated userId :", apiKey.userId ? `ok — ${apiKey.userId.email}` : "POPULATE FAILED (null)");
 
     // Update usage stats (fire-and-forget)
     ApiKey.updateOne({ _id: apiKey._id }, { lastUsed: new Date(), $inc: { callCount: 1 } }).catch(() => {});
 
     return apiKey.userId;
   } catch (err) {
-    console.error("🗝️  [API-KEY] 💥 Exception in findUserByApiKey:", err.message, err.stack);
+    console.error("🗝️  [API-KEY] Exception in findUserByApiKey:", err.message);
     return null;
   }
 };

@@ -44,5 +44,11 @@ router.delete('/tasks/:id', authMiddleware, validatorController.deleteTask);
 // Save valid numbers from a task into a Contact List
 router.post('/tasks/:id/save-list', authMiddleware, validatorController.saveTaskToContactList);
 
+// Add a note to a task
+router.post('/tasks/:id/notes', authMiddleware, validatorController.addTaskNote);
+
+// Delete a note from a task
+router.delete('/tasks/:id/notes/:noteId', authMiddleware, validatorController.deleteTaskNote);
+
 export default router;
 

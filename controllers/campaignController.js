@@ -4,6 +4,7 @@ import WhatsAppSession from "../models/WhatsAppSession.js";
 import Message from "../models/Message.js";
 import mongoose from "mongoose";
 import WhatsAppService from "../services/WhatsAppService.js";
+import CampaignService from "../services/CampaignService.js";
 import SubscriptionService from "../services/SubscriptionService.js";
 import { sendSubscriptionError } from "../utils/subscription.js";
 import path from "path";
@@ -67,6 +68,8 @@ export const createCampaign = async (req, res) => {
       description,
       type,
       message,
+      templateId,
+      templateVariables,
       numberListId,
       sessionId,
       mode,
@@ -90,10 +93,10 @@ export const createCampaign = async (req, res) => {
     await SubscriptionService.assertResourceLimit(req.user, "campaigns", 1);
 
     // Validate required fields
-    if (!name || !type || !message || !numberListId || !sessionId) {
+    if (!name || !type || (!message && !templateId) || !numberListId || !sessionId) {
       return res
         .status(400)
-        .json({ success: false, error: "Missing required fields" });
+        .json({ success: false, error: "Missing required fields (message or templateId required)" });
     }
 
     // Verify session exists and belongs to user
@@ -124,13 +127,24 @@ export const createCampaign = async (req, res) => {
         .json({ success: false, error: "Number list not found" });
     }
 
+    // Guardrail: Enforce MAX_CAMPAIGN_SIZE to prevent MongoDB 16MB document overflows
+    const maxCampaignSize = parseInt(process.env.MAX_CAMPAIGN_SIZE, 10) || 1000;
+    if (numberList.numbers && numberList.numbers.length > maxCampaignSize) {
+      return res.status(400).json({
+        success: false,
+        error: `Campaign exceeds maximum recipient limit (${numberList.numbers.length}/${maxCampaignSize}). Please split into smaller lists.`,
+      });
+    }
+
     // Normalize mode: frontend sends "delayed" → store as "interval"
     const normalizedMode = mode === "delayed" ? "interval" : mode || "instant";
 
-    // Determine delay based on mode
-    let finalDelaySeconds = 0;
+    // Determine delay floor based on environment guardrails to prevent anti-spam bans
+    const minAllowedSec = Math.max(1, Math.floor(parseInt(process.env.MIN_MESSAGE_DELAY || "1000", 10) / 1000));
+    const defaultDelaySec = Math.max(minAllowedSec, Math.floor(parseInt(process.env.DEFAULT_MESSAGE_DELAY || "2000", 10) / 1000));
+    let finalDelaySeconds = minAllowedSec;
     if (normalizedMode === "interval" || normalizedMode === "scheduled") {
-      finalDelaySeconds = Math.max(Number(delaySeconds) || 10, 0);
+      finalDelaySeconds = Math.max(Number(delaySeconds) || defaultDelaySec, minAllowedSec);
     }
 
     // Create campaign
@@ -139,7 +153,9 @@ export const createCampaign = async (req, res) => {
       name,
       description,
       type,
-      message,
+      message: message || "",
+      templateId: templateId ? new mongoose.Types.ObjectId(templateId) : undefined,
+      templateVariables: templateVariables || {},
       numberListId: new mongoose.Types.ObjectId(numberListId),
       sessionId: session._id,
       mode: normalizedMode,
@@ -666,7 +682,7 @@ async function sendCampaignMessages(campaign) {
         console.log(`   [${idx + 1}] ${s.phone} (${s.sessionIdString})`),
       );
     } else {
-      const session = await WhatsAppSession.findById(campaign.sessionId);
+      const session = await WhatsAppSession.findById(campaign.sessionId?._id || campaign.sessionId);
       if (!session) throw new Error("WhatsApp session not found");
       sessionPool = [
         {
@@ -976,10 +992,10 @@ async function sendCampaignMessages(campaign) {
         for (const log of failedLogs) {
           try {
             // Use the session that originally sent (if tracked), otherwise primary
-            const retrySessionId = log.sentBy || campaign.sessionId;
+            const retrySessionId = log.sentBy || campaign.sessionId?._id || campaign.sessionId;
             const retrySession =
               (await WhatsAppSession.findById(retrySessionId)) ||
-              (await WhatsAppSession.findById(campaign.sessionId));
+              (await WhatsAppSession.findById(campaign.sessionId?._id || campaign.sessionId));
             await SubscriptionService.assertMessageQuota(
               { _id: campaign.userId },
               1,
@@ -1121,6 +1137,143 @@ function computeNextRunAt(repeat) {
   return null;
 }
 
+// Update campaign details (name, description, type, message, media, delays, session, numberList)
+export const updateCampaign = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user.id;
+
+    const campaign = await Campaign.findOne({
+      _id: new mongoose.Types.ObjectId(id),
+      userId: new mongoose.Types.ObjectId(userId),
+    });
+
+    if (!campaign) {
+      return res.status(404).json({ success: false, error: "Campaign not found" });
+    }
+
+    if (campaign.status === "running") {
+      return res.status(400).json({
+        success: false,
+        error: "Cannot edit a campaign while it is currently running. Please pause it first.",
+      });
+    }
+
+    const {
+      name,
+      description,
+      type,
+      message,
+      mediaUrl,
+      mediaName,
+      mediaType,
+      mediaFiles,
+      delaySeconds,
+      minDelay,
+      maxDelay,
+      randomizeDelay,
+      autoRetry,
+      mode,
+      scheduledFor,
+      sessionId,
+      numberListId,
+      repeat,
+    } = req.body;
+
+    if (name !== undefined) campaign.name = name.trim();
+    if (description !== undefined) campaign.description = description;
+    if (type !== undefined) campaign.type = type;
+    if (message !== undefined) campaign.message = message;
+    if (mediaUrl !== undefined) campaign.mediaUrl = mediaUrl;
+    if (mediaName !== undefined) campaign.mediaName = mediaName;
+    if (mediaType !== undefined) campaign.mediaType = mediaType;
+    if (mediaFiles !== undefined) campaign.mediaFiles = mediaFiles;
+    if (delaySeconds !== undefined) {
+      const minAllowed = Math.max(1, Math.floor(parseInt(process.env.MIN_MESSAGE_DELAY || "1000", 10) / 1000));
+      campaign.delaySeconds = Math.max(parseInt(delaySeconds) || minAllowed, minAllowed);
+    }
+    if (minDelay !== undefined) campaign.minDelay = parseInt(minDelay) || 10;
+    if (maxDelay !== undefined) campaign.maxDelay = parseInt(maxDelay) || 25;
+    if (randomizeDelay !== undefined) campaign.randomizeDelay = !!randomizeDelay;
+    if (autoRetry !== undefined) campaign.autoRetry = !!autoRetry;
+    if (mode !== undefined) campaign.mode = mode;
+    if (scheduledFor !== undefined) {
+      campaign.scheduledFor = scheduledFor ? new Date(scheduledFor) : null;
+      if (campaign.mode === "scheduled" && campaign.scheduledFor && campaign.scheduledFor > new Date()) {
+        campaign.status = "scheduled";
+      }
+    }
+    if (repeat !== undefined) {
+      campaign.repeat = {
+        enabled: !!repeat.enabled,
+        type: repeat.type || "daily",
+        time: repeat.time || "09:00",
+        days: Array.isArray(repeat.days) ? repeat.days : [],
+      };
+    }
+
+    // If session updated
+    if (sessionId) {
+      let resolvedSession = await WhatsAppSession.findOne({
+        sessionId,
+        userId: new mongoose.Types.ObjectId(userId),
+      });
+      if (!resolvedSession && mongoose.Types.ObjectId.isValid(sessionId)) {
+        resolvedSession = await WhatsAppSession.findOne({
+          _id: new mongoose.Types.ObjectId(sessionId),
+          userId: new mongoose.Types.ObjectId(userId),
+        });
+      }
+      if (resolvedSession) {
+        campaign.sessionId = resolvedSession._id;
+        campaign.sessions = [resolvedSession._id];
+      }
+    }
+
+    // If number list updated and campaign is draft or scheduled, update recipients
+    if (numberListId && String(campaign.numberListId) !== String(numberListId)) {
+      const numberList = await NumberList.findOne({
+        _id: new mongoose.Types.ObjectId(numberListId),
+        userId: new mongoose.Types.ObjectId(userId),
+      });
+      if (numberList) {
+        campaign.numberListId = numberList._id;
+        if (campaign.status === "draft" || campaign.status === "scheduled") {
+          campaign.messageLog = numberList.numbers.map((item) => ({
+            phoneNumber: item.phoneNumber,
+            status: "pending",
+            retryCount: 0,
+          }));
+          campaign.stats = {
+            total: numberList.numbers.length,
+            sent: 0,
+            delivered: 0,
+            failed: 0,
+            pending: numberList.numbers.length,
+          };
+        }
+      }
+    }
+
+    campaign.updatedAt = new Date();
+    await campaign.save();
+
+    const populated = await Campaign.findById(campaign._id)
+      .populate("numberListId", "name")
+      .populate("sessionId", "sessionId phone")
+      .lean();
+
+    res.json({
+      success: true,
+      data: populated,
+      message: "Campaign updated successfully",
+    });
+  } catch (error) {
+    console.error("Error updating campaign:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
 // Update campaign schedule / repeat / delay settings
 export const updateCampaignSchedule = async (req, res) => {
   try {
@@ -1151,7 +1304,10 @@ export const updateCampaignSchedule = async (req, res) => {
     if (minDelay !== undefined) update.minDelay = Number(minDelay);
     if (maxDelay !== undefined) update.maxDelay = Number(maxDelay);
     if (randomizeDelay !== undefined) update.randomizeDelay = !!randomizeDelay;
-    if (delaySeconds !== undefined) update.delaySeconds = Number(delaySeconds);
+    if (delaySeconds !== undefined) {
+      const minAllowedSec = Math.max(1, Math.floor(parseInt(process.env.MIN_MESSAGE_DELAY || "1000", 10) / 1000));
+      update.delaySeconds = Math.max(Number(delaySeconds) || minAllowedSec, minAllowedSec);
+    }
 
     // If switching to scheduled mode with a future date, mark as scheduled
     if (
@@ -1292,9 +1448,158 @@ export const startCampaignById = async (campaignId) => {
   sendCampaignMessages(campaign);
 };
 
+/**
+ * Post-boot orphaned campaign recovery watchdog (Phase 2 - Task 2.1).
+ * Detects campaigns left in "running" state across server restarts.
+ * Resumes execution if WhatsApp session socket is active; cleanly pauses if disconnected.
+ */
+export const recoverOrphanedCampaigns = async (io = null) => {
+  try {
+    const runningCampaigns = await Campaign.find({ status: "running" })
+      .populate("sessionId")
+      .populate("numberListId");
+
+    if (!runningCampaigns || runningCampaigns.length === 0) {
+      console.log("[CAMPAIGN WATCHDOG] No orphaned running campaigns found on startup.");
+      return;
+    }
+
+    console.log(
+      `[CAMPAIGN WATCHDOG] Found ${runningCampaigns.length} orphaned running campaign(s) after reboot. Evaluating recovery status...`
+    );
+
+    const socketIO = io || WhatsAppService.io;
+
+    for (const campaign of runningCampaigns) {
+      try {
+        const hasMessageLog = Array.isArray(campaign.messageLog) && campaign.messageLog.length > 0;
+        const pendingCount = hasMessageLog
+          ? campaign.messageLog.filter((m) => m.status === "pending").length
+          : Array.isArray(campaign.numbers)
+            ? Math.max(0, campaign.numbers.length - (campaign.currentIndex || 0))
+            : 0;
+
+        // If all messages were already processed before reboot
+        if (pendingCount === 0) {
+          campaign.status = "completed";
+          campaign.progress = 100;
+          campaign.completedAt = new Date();
+          await campaign.save();
+
+          console.log(
+            `[CAMPAIGN WATCHDOG] Campaign "${campaign.name}" (${campaign._id}) has 0 pending messages. Marked as completed.`
+          );
+
+          if (socketIO && campaign.userId) {
+            socketIO.to(`user:${campaign.userId}`).emit("campaign:completed", {
+              campaignId: String(campaign._id),
+              status: "completed",
+              progress: 100,
+              completedAt: campaign.completedAt,
+              stats: campaign.stats,
+            });
+          }
+          continue;
+        }
+
+        // Determine if target WhatsApp session is active and socket connected
+        let isSessionConnected = false;
+        let sessionIdentifier = "";
+
+        if (campaign.multiSession?.enabled && campaign.sessions?.length > 1) {
+          const sessions = await WhatsAppSession.find({
+            _id: { $in: campaign.sessions },
+          }).lean();
+          const activeSessions = sessions.filter(
+            (s) => s.status === "connected" && WhatsAppService.getSocket(s.sessionId)
+          );
+          isSessionConnected = activeSessions.length > 0;
+          sessionIdentifier = `multi-session (${activeSessions.length}/${sessions.length} connected)`;
+        } else {
+          const sessionDoc = campaign.sessionId?._id
+            ? campaign.sessionId
+            : await WhatsAppSession.findById(campaign.sessionId).lean();
+
+          if (sessionDoc?.sessionId) {
+            sessionIdentifier = sessionDoc.sessionId;
+            isSessionConnected = Boolean(
+              sessionDoc.status === "connected" &&
+              WhatsAppService.getSocket(sessionDoc.sessionId)
+            );
+          }
+        }
+
+        if (isSessionConnected) {
+          console.log(
+            `[CAMPAIGN WATCHDOG] WhatsApp session [${sessionIdentifier}] is ACTIVE. Resuming campaign "${campaign.name}" (${campaign._id}) with ${pendingCount} pending messages.`
+          );
+
+          campaign.resumedAt = new Date();
+          await campaign.save();
+
+          if (socketIO && campaign.userId) {
+            socketIO.to(`user:${campaign.userId}`).emit("campaign:resumed", {
+              campaignId: String(campaign._id),
+              name: campaign.name,
+              pendingCount,
+              resumedAt: campaign.resumedAt,
+            });
+          }
+
+          if (hasMessageLog) {
+            sendCampaignMessages(campaign).catch((sendErr) =>
+              console.error(`[CAMPAIGN WATCHDOG] Error in resumed campaign ${campaign._id}:`, sendErr.message)
+            );
+          } else if (Array.isArray(campaign.numbers) && campaign.numbers.length > 0) {
+            CampaignService.activeCampaigns.set(campaign._id.toString(), { running: true, cancelled: false });
+            CampaignService.processCampaign(campaign).catch((sendErr) =>
+              console.error(`[CAMPAIGN WATCHDOG] Error in resumed CampaignService ${campaign._id}:`, sendErr.message)
+            );
+          }
+        } else {
+          console.warn(
+            `[CAMPAIGN WATCHDOG] WhatsApp session [${sessionIdentifier || "unknown"}] is DISCONNECTED for campaign "${campaign.name}" (${campaign._id}). Transitioning to paused state.`
+          );
+
+          await Campaign.updateOne(
+            { _id: campaign._id },
+            {
+              $set: {
+                status: "paused",
+                pausedAt: new Date(),
+                lastError: "Server restarted while campaign was running; assigned WhatsApp session is disconnected.",
+              },
+            }
+          );
+
+          if (socketIO && campaign.userId) {
+            socketIO.to(`user:${campaign.userId}`).emit("campaign:paused", {
+              campaignId: String(campaign._id),
+              status: "paused",
+              pausedAt: new Date(),
+              reason: "Server restarted; assigned session disconnected",
+              lastError: "Server restarted while campaign was running; assigned WhatsApp session is disconnected.",
+            });
+          }
+        }
+      } catch (campErr) {
+        console.error(
+          `[CAMPAIGN WATCHDOG] Failed to evaluate recovery for campaign ${campaign._id}:`,
+          campErr.message
+        );
+      }
+    }
+  } catch (err) {
+    console.error("[CAMPAIGN WATCHDOG] Error during orphaned campaign recovery scan:", err.message);
+  }
+};
+
+export { sendCampaignMessages };
+
 export default {
   uploadCampaignMedia,
   createCampaign,
+  updateCampaign,
   getCampaigns,
   getCampaignDetails,
   startCampaign,
@@ -1306,4 +1611,5 @@ export default {
   getCampaignReport,
   updateCampaignSchedule,
   updateCampaignSession,
+  recoverOrphanedCampaigns,
 };

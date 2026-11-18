@@ -12,12 +12,22 @@ const messageCounterSchema = new mongoose.Schema(
   { _id: false },
 );
 
+const storageBreakdownSchema = new mongoose.Schema(
+  {
+    mediaLibraryBytes: { type: Number, default: 0 },
+    chatMediaBytes: { type: Number, default: 0 },
+    campaignMediaBytes: { type: Number, default: 0 },
+  },
+  { _id: false },
+);
+
 const usageSnapshotSchema = new mongoose.Schema(
   {
     sessions: { type: Number, default: 0 },
     campaigns: { type: Number, default: 0 },
     numberLists: { type: Number, default: 0 },
     storageBytes: { type: Number, default: 0 },
+    storageBreakdown: { type: storageBreakdownSchema, default: () => ({}) },
     messages: { type: messageCounterSchema, default: () => ({}) },
     updatedAt: { type: Date, default: Date.now },
   },
@@ -47,6 +57,7 @@ const userSubscriptionSchema = new mongoose.Schema(
     expiresAt: { type: Date, default: null },
     trialUsed: { type: Boolean, default: false },
     location: { type: String, default: "" },
+    customStorageLimitMb: { type: Number, default: null }, // Admin custom storage override in MB (null = follow plan limit)
     usage: { type: usageSnapshotSchema, default: () => ({}) },
   },
   { timestamps: true },

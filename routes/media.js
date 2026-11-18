@@ -40,6 +40,9 @@ router.post(
   mediaController.uploadToSubcollection,
 );
 
+// Media rename route
+router.put("/:id/media/:mediaId/rename", mediaController.renameMedia);
+
 // Media delete routes
 router.delete("/:id/media/:mediaId", mediaController.deleteMediaFromCollection);
 router.delete(

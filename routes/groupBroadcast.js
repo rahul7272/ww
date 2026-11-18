@@ -406,10 +406,10 @@ router.get("/status/:id", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /api/group-broadcast/list
+ * GET /api/group-broadcast (and /api/group-broadcast/list)
  * Returns all group broadcasts for the logged-in user, sorted by date
  */
-router.get("/list", authMiddleware, async (req, res) => {
+router.get(["/", "/list"], authMiddleware, async (req, res) => {
   try {
     const list = await GroupBroadcast.find({ userId: req.user._id }).sort({ createdAt: -1 });
     res.json({ success: true, list });

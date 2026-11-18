@@ -243,7 +243,13 @@ const debugTokenStatus = async (req, res) => {
       });
     }
 
-    return res.json({ success: true, session: status });
+    const safeSession = { ...status };
+    if (safeSession.graph) {
+      safeSession.graph = { ...safeSession.graph };
+      delete safeSession.graph.facebookUserAccessToken;
+      delete safeSession.graph.accessToken;
+    }
+    return res.json({ success: true, session: safeSession });
   } catch (err) {
     console.error("[IG DEBUG TOKEN]", err.message);
     return res.status(500).json({ error: err.message });

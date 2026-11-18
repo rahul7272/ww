@@ -2,6 +2,7 @@ import MetaMessage from "../models/MetaMessage.js";
 import MetaSystemSettings from "../models/MetaSystemSettings.js";
 import WABAccount from "../models/WABAccount.js";
 import InstagramDMMessage from "../../instagram/models/InstagramDMMessage.js";
+import { addWebhookJob } from "../../queues/templateQueue.js";
 
 // GET /api/meta/webhook  (Meta verification)
 export async function verifyWebhook(req, res) {
@@ -23,64 +24,78 @@ export async function verifyWebhook(req, res) {
   res.status(403).send("Forbidden");
 }
 
+// Internal asynchronous processor for Meta WhatsApp events
+export async function processMetaWhatsAppPayload(body) {
+  if (!body) return;
+
+  // handle WhatsApp
+  if (body.object === "whatsapp_business_account") {
+    for (const entry of body.entry || []) {
+      for (const change of entry.changes || []) {
+        if (change.field !== "messages") continue;
+
+        const value = change.value;
+
+        // Status updates
+        for (const status of value.statuses || []) {
+          await handleStatusUpdate(status);
+        }
+
+        // Incoming messages
+        for (const message of value.messages || []) {
+          await handleIncomingMessage(message, value.metadata);
+        }
+      }
+    }
+  }
+
+  // handle Instagram (fallback via webhook). Meta may deliver IG events under 'page' or 'instagram' objects.
+  if (body.entry && Array.isArray(body.entry)) {
+    for (const entry of body.entry) {
+      for (const change of entry.changes || []) {
+        const val = change.value || {};
+        const messages =
+          val.messages ||
+          val.messaging ||
+          val.direct_messages ||
+          val.direct_message ||
+          [];
+        if (!messages || (Array.isArray(messages) && messages.length === 0))
+          continue;
+
+        for (const msg of messages) {
+          try {
+            await handleInstagramIncoming(msg, val);
+          } catch (e) {
+            console.error(
+              "[Webhook] Instagram message save failed",
+              e?.message || e,
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
 // POST /api/meta/webhook  (Meta events)
 export async function receiveWebhook(req, res) {
   try {
-    res.sendStatus(200); // respond immediately
+    // 1. Fast HTTP 200 response to Meta within ~5ms to prevent delivery timeouts
+    res.sendStatus(200);
 
-    const body = req.body;
-
-    // handle WhatsApp (existing)
-    if (body.object === "whatsapp_business_account") {
-      for (const entry of body.entry || []) {
-        for (const change of entry.changes || []) {
-          if (change.field !== "messages") continue;
-
-          const value = change.value;
-
-          // Status updates
-          for (const status of value.statuses || []) {
-            await handleStatusUpdate(status);
-          }
-
-          // Incoming messages
-          for (const message of value.messages || []) {
-            await handleIncomingMessage(message, value.metadata);
-          }
-        }
-      }
-    }
-
-    // handle Instagram (fallback via webhook). Meta may deliver IG events under 'page' or 'instagram' objects.
-    if (body.entry && Array.isArray(body.entry)) {
-      for (const entry of body.entry) {
-        for (const change of entry.changes || []) {
-          const val = change.value || {};
-          // Look for instagram message payloads in common fields
-          const messages =
-            val.messages ||
-            val.messaging ||
-            val.direct_messages ||
-            val.direct_message ||
-            [];
-          if (!messages || (Array.isArray(messages) && messages.length === 0))
-            continue;
-
-          for (const msg of messages) {
-            try {
-              await handleInstagramIncoming(msg, val);
-            } catch (e) {
-              console.error(
-                "[Webhook] Instagram message save failed",
-                e?.message || e,
-              );
-            }
-          }
-        }
-      }
+    // 2. Buffer into BullMQ queue to protect Node.js event loop & DB connection pool
+    const enqueued = await addWebhookJob("process_meta_whatsapp_webhook", { body: req.body });
+    if (!enqueued) {
+      // Graceful fallback: If Redis is unreachable, process asynchronously via microtask queue
+      setImmediate(() => {
+        processMetaWhatsAppPayload(req.body).catch((err) => {
+          console.error("[Webhook Fallback] Processing error:", err.message);
+        });
+      });
     }
   } catch (err) {
-    console.error("[Webhook] Processing error:", err.message);
+    console.error("[Webhook] Ingress error:", err.message);
   }
 }
 
